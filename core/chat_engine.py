@@ -28,13 +28,14 @@ from openai import RateLimitError
 
 from config import (
     BR_TZ,
-    CHANNEL_CONTEXT_MESSAGES,
     CHAT_BURST_SECONDS,
+    CHAT_BURST_SHORT_SECONDS,
     CHAT_DELETE_WITH_TRIGGER,
     CHAT_EDIT_WINDOW_SECONDS,
     CHAT_GUILD_BUDGET,
     CHAT_GUILD_BUDGET_WINDOW,
     CHAT_MENTION_CONTINUE_ENABLED,
+    CHAT_MENTION_CONTINUE_WINDOW,
     CHAT_MENTION_ENABLED,
     CHAT_NAME_ALIASES,
     CHAT_USER_BUDGET,
@@ -98,7 +99,7 @@ class ChatEngine:
         self.bot = bot
         self.services = services
         self.store = services.conversations
-        self.bursts = BurstCollector(burst_delay, self.answer_burst)
+        self.bursts = BurstCollector(burst_delay, self.answer_burst, delay_for=self.burst_delay)
         self.budget = budget or Budget(
             user_limit=CHAT_USER_BUDGET, user_window=CHAT_USER_BUDGET_WINDOW,
             guild_limit=CHAT_GUILD_BUDGET, guild_window=CHAT_GUILD_BUDGET_WINDOW,
@@ -117,6 +118,23 @@ class ChatEngine:
     @property
     def bot_user(self) -> Any:
         return getattr(self.bot, 'user', None)
+
+    def burst_delay(self, burst: Burst) -> float:
+        """How long to wait for more messages: longer while the burst only points at something.
+
+        "ai oh @bot" or "olha isso" with no image, link or reply yet usually has
+        the thing itself coming in the next message, which may take a few
+        seconds to upload.
+        """
+        base = self.bursts.delay
+        pointing = all(
+            len(self._clean(m)) <= 20
+            and not message_media.visual_sources(m)
+            and not getattr(getattr(m, 'reference', None), 'message_id', None)
+            and not re.search(r'https?://', m.content or '')
+            for m in burst.messages
+        )
+        return max(base, CHAT_BURST_SHORT_SECONDS) if pointing else base
 
     def settings_for(self, guild: Any, channel: Any) -> dict[str, Any]:
         return self.services.settings.for_channel(guild, channel)
@@ -262,12 +280,12 @@ class ChatEngine:
             text = message_media.question_with_media(self._clean(m), m)
             if text:
                 texts.append(text)
-            images.extend(await image_store.persist_images(message_media.visual_sources(m)))
+            images.extend(await image_store.persist_shown(message_media.visual_sources(m)))
             ref = getattr(m, 'reference', None)
             ref_id = getattr(ref, 'message_id', None)
             if not ref_context and ref_id and str(ref_id) != str(skip_ref or ''):
                 ref_context, ref_images = await self.reply_context(m)
-                images.extend(await image_store.persist_images(ref_images))
+                images.extend(await image_store.persist_shown(ref_images))
         body = '\n'.join(texts)
         topic = body
         if ref_context:
@@ -299,7 +317,7 @@ class ChatEngine:
             return None, None, None
         recent = await find_recent_conversation(
             self.store, burst.first.channel, self.bot_user.id,
-            before=burst.first, limit=CHANNEL_CONTEXT_MESSAGES,
+            before=burst.first, limit=CHAT_MENTION_CONTINUE_WINDOW,
         )
         if recent:
             handle_id, conv = recent
@@ -705,7 +723,7 @@ class ChatEngine:
                 return
             await interaction.response.defer(thinking=True)
             await self._status(interaction, '💭 Pensando…')
-        image_url = await image_store.persist_attachment(image) if image is not None else None
+        image_url = (await image_store.persist_shown([image]) or [None])[0] if image is not None else None
         settings = self.settings_for(guild, channel)
         thread_mode = settings.get('threads')
         blocker = chat_threads.thread_blocker(channel, thread_mode)

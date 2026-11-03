@@ -702,6 +702,9 @@ def build_current_message(
         context_inline, _ = _split_images(context_images)
         inline = current_inline + context_inline
         dropped += current_missing
+        if current_inline:
+            note = image_store.shown_image_note(len(current_inline))
+            text = f'{text}\n\n{note}' if text else note
         if context_inline:
             note = image_store.context_image_note(
                 len(context_inline), after_user_images=bool(current_inline),

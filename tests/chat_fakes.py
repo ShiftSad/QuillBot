@@ -281,9 +281,11 @@ def make_engine(tmp_path, monkeypatch, *, answers=('Reduz o view-distance.',), t
     monkeypatch.setattr(chat_engine, 'message_participant_infos', no_participants)
     monkeypatch.setattr(chat_engine, 'fetch_turn_gap', no_gap)
     monkeypatch.setattr(chat_engine.image_store, 'persist_images', no_images)
+    monkeypatch.setattr(chat_engine.image_store, 'persist_shown', no_images)
     monkeypatch.setattr(chat_engine, 'CHAT_MENTION_ENABLED', True)
     monkeypatch.setattr(chat_engine, 'CHAT_MENTION_CONTINUE_ENABLED', True)
-    monkeypatch.setattr(chat_engine, 'CHANNEL_CONTEXT_MESSAGES', 10)
+    monkeypatch.setattr(chat_engine, 'CHAT_MENTION_CONTINUE_WINDOW', 10)
+    monkeypatch.setattr(chat_engine, 'CHAT_BURST_SHORT_SECONDS', 0)  # tests opt in to the longer wait
     monkeypatch.setattr(chat_threads, 'CHAT_THREADS_ENABLED', True)
     monkeypatch.setattr(chat_threads, 'CHAT_THREAD_AFTER_TURNS', 3)
     monkeypatch.setattr(chat_threads, 'CHAT_THREAD_CHANNELS', frozenset())

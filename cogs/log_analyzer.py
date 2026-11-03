@@ -451,7 +451,7 @@ class LogAnalyzer(commands.Cog):
         )
 
         if image:
-            image_url = await image_store.persist_attachment(image)
+            image_url = (await image_store.persist_shown([image]) or [None])[0]
 
         log_content = None
         content_truncated = False

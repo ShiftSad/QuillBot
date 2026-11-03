@@ -35,6 +35,8 @@ ROLE = (
     "Sua personalidade, seu jeito de falar e suas regras de convivência são definidos pelo "
     "próprio servidor: siga o bloco <personalidade> quando houver, e também as memórias do "
     "servidor (bloco <memory>) que digam como você é ou deve agir.\n"
+    "A personalidade muda o seu jeito de falar, nunca o que você faz: quando pedirem algo "
+    "(pesquisar, explicar, conferir), faça de verdade.\n"
     "</role>"
 )
 
@@ -130,6 +132,20 @@ THREAD_INSTRUCTIONS = (
     "ficam no canal.\n"
 ) if CHAT_THREADS_ENABLED and CHAT_THREAD_TOOL_ENABLED else ""
 
+TASK_INSTRUCTIONS = (
+    "- Quando pedirem para pesquisar, procurar ou buscar algo, pesquise de verdade antes de "
+    "responder (`web_search`; `search_docs` para Minecraft) — nunca responda de cabeça nem "
+    "diga que não precisou.\n"
+    "- Antes de responder sobre algo que a pessoa só aponta (\"esse sinal\", \"isso\", \"o que "
+    "ele disse\"), descubra a que ela se refere. As mensagens recentes do canal podem não "
+    "alcançar o começo do assunto: se não estiver claro, leia mais com `get_channel_history` "
+    "(limit maior) em vez de adivinhar.\n"
+    "- O que a pessoa está te mostrando são as imagens que vieram com a mensagem dela (ou com a "
+    "mensagem que ela respondeu); imagens do canal são só contexto. Se ela aponta para uma "
+    "imagem ou link (\"olha isso\", \"ai oh\") e nada veio junto, diga que não recebeu em vez "
+    "de supor qual é.\n"
+)
+
 PERSONA_INSTRUCTIONS = (
     "- As notas do bloco <personalidade> são suas: quando algo vira parte de quem você é neste "
     "servidor — uma piada interna que pegou, um apelido que te deram, um bordão — reescreva-as "
@@ -186,6 +202,7 @@ CHAT_SYSTEM_PROMPT = (
     "<instructions>\n"
     + MEMORY_INSTRUCTIONS
     + EPISODE_INSTRUCTIONS
+    + TASK_INSTRUCTIONS
     + DOCS_INSTRUCTIONS
     + WEB_SEARCH_INSTRUCTIONS
     + SCHEDULER_INSTRUCTIONS
@@ -208,6 +225,7 @@ ASK_SYSTEM_PROMPT = (
     "servidores Minecraft, chame `search_docs` imediatamente.\n"
     + MEMORY_INSTRUCTIONS
     + EPISODE_INSTRUCTIONS
+    + TASK_INSTRUCTIONS
     + "- Baseie cada resposta nos dados retornados pelas ferramentas, não em conhecimento de treinamento.\n"
     "- Se a pergunta for vaga ou ambígua, peça esclarecimentos — omita chamadas de ferramentas.\n"
     "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "

@@ -48,9 +48,14 @@ class Burst:
 class BurstCollector:
     """Debounce bot-directed messages per (channel, author) and hand bursts to *process*."""
 
-    def __init__(self, delay: float, process: Callable[[Burst], Awaitable[None]]):
+    def __init__(
+        self, delay: float, process: Callable[[Burst], Awaitable[None]],
+        *, delay_for: Callable[[Burst], float] | None = None,
+    ):
         self.delay = delay
         self.process = process
+        # Per-burst wait (e.g. longer while it only says "olha isso"); defaults to *delay*.
+        self.delay_for = delay_for
         self._open: dict[BurstKey, Burst] = {}
         self._timers: dict[BurstKey, asyncio.Task] = {}
         self._running: dict[BurstKey, asyncio.Event] = {}
@@ -95,8 +100,15 @@ class BurstCollector:
         self._timers[key] = asyncio.get_running_loop().create_task(self._wait_and_flush(key))
 
     async def _wait_and_flush(self, key: BurstKey) -> None:
+        burst = self._open.get(key)
+        delay = self.delay
+        if burst is not None and self.delay_for is not None:
+            try:
+                delay = self.delay_for(burst)
+            except Exception:
+                logger.debug('[burst] delay_for failed', exc_info=True)
         try:
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
         if self._timers.get(key) is asyncio.current_task():

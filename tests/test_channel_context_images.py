@@ -224,7 +224,7 @@ def test_attachment_download_is_reused():
             reads.append(1)
             return b'bytes'
 
-    async def persist(data):
+    async def persist(data, **kw):
         ref = 'img:stored.jpg'
         with open(store.image_path(ref), 'wb') as f:
             f.write(data)

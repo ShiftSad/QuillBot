@@ -20,6 +20,7 @@ from config import (
     BR_TZ,
     CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES,
     CHANNEL_CONTEXT_IMAGES_ENABLED,
+    CHANNEL_CONTEXT_MAX_CHARS,
     CHANNEL_CONTEXT_MESSAGES,
     CONVERSATIONS_GAP_MESSAGES,
 )
@@ -284,6 +285,7 @@ async def fetch_recent_channel_context(
     )
     if not isinstance(context, ChannelContext):
         context = ChannelContext(text=context)
+    context = _trim_oldest(context, CHANNEL_CONTEXT_MAX_CHARS)
     logger.info(
         "Recent channel context channel=%s messages=%d images=%d",
         getattr(channel, 'id', None), len(context.lines), len(context.images),
@@ -293,6 +295,23 @@ async def fetch_recent_channel_context(
         lines=context.lines,
         images=context.images,
     )
+
+
+def _trim_oldest(context: ChannelContext, max_chars: int) -> ChannelContext:
+    """Drop the oldest lines until the window fits *max_chars* (newest lines always kept)."""
+    lines = context.lines
+    if max_chars <= 0 or not lines or sum(len(line) + 1 for line in lines) <= max_chars:
+        return context
+    kept: list[str] = []
+    used = 0
+    for line in reversed(lines):
+        if kept and used + len(line) + 1 > max_chars:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    kept.reverse()
+    header = context.text.split('\n', 1)[0].replace(f'últimas {len(lines)} mensagens', f'últimas {len(kept)} mensagens')
+    return ChannelContext(text=header + '\n' + '\n'.join(kept), lines=kept, images=context.images)
 
 
 async def fetch_channel_gap(

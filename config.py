@@ -129,6 +129,11 @@ HISTORY_RRF_K: Final[int] = int(os.getenv('HISTORY_RRF_K', '60'))
 # images are persisted under IMAGES_DIR and re-sent inline per request.
 IMAGES_DIR: Final[str] = os.getenv('IMAGES_DIR', 'data/images')
 IMAGE_MAX_SIDE: Final[int] = int(os.getenv('IMAGE_MAX_SIDE', '640'))
+# Images someone shows the bot (attached to the message it answers, to the
+# message that one replies to, or to /chat, /ask, /analyze) are kept sharper:
+# screenshots of text (logs, code, a GitHub page) are unreadable at 640px.
+# Channel-context images stay at IMAGE_MAX_SIDE.
+IMAGE_MAX_SIDE_SHOWN: Final[int] = int(os.getenv('IMAGE_MAX_SIDE_SHOWN', '1280'))
 IMAGE_JPEG_QUALITY: Final[int] = int(os.getenv('IMAGE_JPEG_QUALITY', '80'))
 IMAGE_RETENTION_SECONDS: Final[float] = float(os.getenv('IMAGE_RETENTION_SECONDS', '86400'))
 # Inline stored images only for the most recent N history turns (older → text marker)
@@ -139,6 +144,8 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # A mention continues the newest /chat conversation whose bot message is within
 # the last CHANNEL_CONTEXT_MESSAGES channel messages (like replying to it).
 CHAT_MENTION_CONTINUE_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_CONTINUE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# How many recent channel messages a mention looks back for the bot's conversation.
+CHAT_MENTION_CONTINUE_WINDOW: Final[int] = int(os.getenv('CHAT_MENTION_CONTINUE_WINDOW', '10'))
 
 # The bot also answers when it is called by name without an @ ("quill, o que
 # acha?"). Names: its server nickname, its username, those without a trailing
@@ -160,6 +167,10 @@ CHAT_PLAIN_MAX_CHARS: Final[int] = int(os.getenv('CHAT_PLAIN_MAX_CHARS', '2000')
 # until the person has been quiet this many seconds and answers all of it as
 # one turn. Messages sent while it is answering become the next turn.
 CHAT_BURST_SECONDS: Final[float] = float(os.getenv('CHAT_BURST_SECONDS', '2.5'))
+# A burst that so far only points at something ("ai oh @bot", "olha isso") —
+# short text, no image — waits this long instead, so the image or link sent
+# right after it (uploads take a few seconds) is part of the turn.
+CHAT_BURST_SHORT_SECONDS: Final[float] = float(os.getenv('CHAT_BURST_SHORT_SECONDS', '6'))
 # Cost guard instead of a per-message cooldown: at most N answered turns per
 # person per window, and per server per window (0 disables each). Over budget,
 # the bot reacts with ⏳ instead of answering.
@@ -188,8 +199,11 @@ CHAT_THREAD_TOOL_ENABLED: Final[bool] = os.getenv('CHAT_THREAD_TOOL_ENABLED', 't
 CHAT_THREAD_ARCHIVE_MINUTES: Final[int] = int(os.getenv('CHAT_THREAD_ARCHIVE_MINUTES', '60'))
 
 # --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
-# Number of latest channel messages sent to the LLM as conversation context; 0 disables.
-CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '10'))
+# Latest channel messages sent to the LLM as conversation context (0 disables),
+# trimmed from the oldest side to CHANNEL_CONTEXT_MAX_CHARS. In a fast chat ten
+# messages is a minute of talk, and "pesquise esse sinal" can point further back.
+CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '30'))
+CHANNEL_CONTEXT_MAX_CHARS: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MAX_CHARS', '6000'))
 # Also send images attached to those channel messages (and to follow-up gaps) to
 # the model. Disable for text-only CHAT_MODELs or to keep other users' images
 # away from the provider.

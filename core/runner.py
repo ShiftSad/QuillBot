@@ -18,6 +18,7 @@ and providers can prefix-cache them.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from config import CHANNEL_CONTEXT_MESSAGES, CONVERSATIONS_HISTORY_TURNS
@@ -82,6 +83,20 @@ def _system_prompt(ctx: TurnContext) -> str:
         # changes when participants/channel actually change.
         system += '\n\n' + build_conversation_block(ctx.history)
     return system
+
+
+# "pesquise", "procura aí", "busca isso", "dá um google": the person asked for a search.
+_SEARCH_REQUEST_RE = re.compile(r'\b(pesquis\w*|procur[ae]\w*|busc[ae]\w*|busque\w*|googl\w*)\b', re.I)
+SEARCH_HINT = (
+    '[Nesta mensagem a pessoa pediu uma pesquisa: use web_search (ou search_docs, para Minecraft) '
+    'antes de responder.]'
+)
+
+
+def search_requested(question: str) -> bool:
+    """Whether the person's own words (not a quoted message or routing header) ask for a search."""
+    own = (question or '').rsplit('\n---\n', 1)[-1]
+    return bool(_SEARCH_REQUEST_RE.search(own))
 
 
 def _channel_block(ctx: TurnContext) -> str | None:
@@ -153,6 +168,9 @@ async def run_turn(ctx: TurnContext) -> TurnResult:
     services = ctx.services
     profile = ctx.profile
     blocks, context_images = await _context_blocks(ctx)
+    offered = set(profile.tools) & set(services.tools.names())
+    if offered & {'web_search', 'search_docs'} and search_requested(ctx.question):
+        blocks.append(SEARCH_HINT)
 
     messages: list[dict] = [apply_cache_control({'role': 'system', 'content': _system_prompt(ctx)})]
     if ctx.spark_report is not None:
