@@ -122,7 +122,9 @@ class ChatEngine:
         self.bot = bot
         self.services = services
         self.store = services.conversations
-        self.bursts = BurstCollector(burst_delay, self.answer_burst, delay_for=self.burst_delay)
+        self.bursts = BurstCollector(
+            burst_delay, self.answer_burst, delay_for=self.burst_delay, takes_followups=self.takes_followups,
+        )
         self.budget = budget or Budget(
             user_limit=CHAT_USER_BUDGET, user_window=CHAT_USER_BUDGET_WINDOW,
             guild_limit=CHAT_GUILD_BUDGET, guild_window=CHAT_GUILD_BUDGET_WINDOW,
@@ -158,6 +160,18 @@ class ChatEngine:
             for m in burst.messages
         )
         return max(base, CHAT_BURST_SHORT_SECONDS) if pointing else base
+
+    @staticmethod
+    def takes_followups(burst: Burst) -> bool:
+        """Whether what this person says while *burst* is answered becomes the next turn.
+
+        Only after they spoke to the bot (a mention or a reply). Someone who
+        only named it ("vamos melhorar esse logo do quill") is talking to the
+        channel, and their "kkkkk" while the bot answers is not for it; they
+        call it again to go on. Lines typed before the answer starts still
+        join the burst: "quill" / "o que acha do paper?" is one message.
+        """
+        return any(t in _DIRECTED for t in burst.triggers)
 
     def settings_for(self, guild: Any, channel: Any) -> dict[str, Any]:
         return self.services.settings.for_channel(guild, channel)

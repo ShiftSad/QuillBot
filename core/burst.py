@@ -5,7 +5,9 @@ per-user cooldown answered the first and dropped the rest with "⏳ Aguarde".
 Now a message aimed at the bot opens a *burst* for (channel, person); every
 message that person sends there before going quiet for ``delay`` seconds joins
 it, mention or not, and the whole burst is answered as one turn. Messages
-sent while the bot is still answering start the next burst.
+sent while the bot is still answering start the next burst, but only when the
+burst being answered *takes follow-ups* (see ``takes_followups``): after the
+bot was merely named, what the person says next is for the channel.
 """
 
 from __future__ import annotations
@@ -51,14 +53,19 @@ class BurstCollector:
     def __init__(
         self, delay: float, process: Callable[[Burst], Awaitable[None]],
         *, delay_for: Callable[[Burst], float] | None = None,
+        takes_followups: Callable[[Burst], bool] | None = None,
     ):
         self.delay = delay
         self.process = process
         # Per-burst wait (e.g. longer while it only says "olha isso"); defaults to *delay*.
         self.delay_for = delay_for
+        # Whether messages without a trigger, sent while a burst is answered, become
+        # the next turn; defaults to always.
+        self.takes_followups = takes_followups
         self._open: dict[BurstKey, Burst] = {}
         self._timers: dict[BurstKey, asyncio.Task] = {}
         self._running: dict[BurstKey, asyncio.Event] = {}
+        self._following: set[BurstKey] = set()  # running bursts that take follow-ups
 
     @staticmethod
     def key_for(message: Any) -> BurstKey:
@@ -66,14 +73,14 @@ class BurstCollector:
 
     def is_open(self, key: BurstKey) -> bool:
         """Whether a message from this person here would join a burst (collecting or being answered)."""
-        return key in self._open or key in self._running
+        return key in self._open or key in self._following
 
     async def add(self, message: Any, trigger: str | None) -> bool:
         """Add *message*; ``trigger=None`` only joins an open burst. Returns whether it was taken."""
         key = self.key_for(message)
         burst = self._open.get(key)
         if burst is None:
-            if trigger is None and key not in self._running:
+            if trigger is None and key not in self._following:
                 return False
             burst = self._open[key] = Burst(key)
         burst.messages.append(message)
@@ -128,11 +135,17 @@ class BurstCollector:
             return
         done = self._running[key] = asyncio.Event()
         try:
+            if self.takes_followups is None or self.takes_followups(burst):
+                self._following.add(key)
+        except Exception:
+            logger.debug('[burst] takes_followups failed', exc_info=True)
+        try:
             await self.process(burst)
         except Exception:
             logger.exception('[burst] failed to answer burst %s', key)
         finally:
             self._running.pop(key, None)
+            self._following.discard(key)
             done.set()
         if key in self._open and key not in self._timers:
             if self.delay <= 0:

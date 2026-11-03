@@ -68,6 +68,67 @@ async def test_messages_sent_while_answering_become_the_next_turn(tmp_path, monk
           stored and stored['conv_id'] == '81' and len(stored['data']['turns']) == 2, stored)
 
 
+def gated_turns(monkeypatch):
+    """A run_turn whose turns wait for their own release event; returns (questions, releases)."""
+    questions, releases = [], []
+
+    async def slow_turn(ctx):
+        questions.append(ctx.question)
+        gate = asyncio.Event()
+        releases.append(gate)
+        await gate.wait()
+        return TurnResult(answer='ok', sources=[], user_message={'role': 'user', 'content': ctx.question})
+
+    monkeypatch.setattr(chat_engine, 'run_turn', slow_turn)
+    return questions, releases
+
+
+async def test_being_named_takes_no_follow_ups_while_answering(tmp_path, monkeypatch):
+    """LS418: "Vamos melhorar esse logo do quill", then "Kkkkkk" got a second reply of its own."""
+    engine = make_engine(tmp_path, monkeypatch)
+    engine.bursts.delay = 0.02
+    questions, releases = gated_turns(monkeypatch)
+    channel = TextChannel(Guild())
+    await engine.handle_message(Message(80, channel, 'vamos melhorar esse logo do quill'))
+    await asyncio.sleep(0.06)
+    check('the name call is being answered', len(questions) == 1 and questions[0].startswith(NAME_HEADER), questions)
+    check('"kkkkk" meanwhile is not for the bot', not await engine.handle_message(Message(90, channel, 'Kkkkkk')))
+    check('a mention meanwhile still is', await engine.handle_message(Message(91, channel, f'<@{BOT_ID}> e aí?')))
+    releases[0].set()
+    await asyncio.sleep(0.1)
+    check('only the mention became a next turn', len(questions) == 2 and questions[1] == 'e aí?', questions)
+    releases[1].set()
+    await asyncio.sleep(0.02)
+
+
+async def test_lines_typed_before_the_answer_still_join_a_name_call(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    engine.bursts.delay = 0.05
+    channel = TextChannel(Guild())
+    check('the name opens a burst', await engine.handle_message(Message(80, channel, 'quill')))
+    check('the next line joins it', await engine.handle_message(Message(81, channel, 'o que acha do paper?')))
+    await asyncio.sleep(0.15)
+    check('answered once, with both lines', len(engine.turns) == 1
+          and engine.turns[0].question == f'{NAME_HEADER}\n---\nquill\no que acha do paper?', engine.turns)
+
+
+async def test_a_follow_up_turn_takes_no_more_follow_ups(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    engine.bursts.delay = 0.02
+    questions, releases = gated_turns(monkeypatch)
+    channel = TextChannel(Guild())
+    await engine.handle_message(Message(80, channel, f'<@{BOT_ID}> pergunta'))
+    await asyncio.sleep(0.06)
+    check('after a mention, a line meanwhile is taken', await engine.handle_message(Message(90, channel, 'ah, e outra coisa')))
+    releases[0].set()
+    await asyncio.sleep(0.08)
+    check('and answered next', len(questions) == 2 and questions[1].startswith(FOLLOW_HEADER), questions)
+    check('but what comes during that answer is not', not await engine.handle_message(Message(95, channel, 'kkkk')))
+    releases[1].set()
+    await asyncio.sleep(0.05)
+    check('two turns in all', len(questions) == 2, questions)
+
+
 # --- Budget -------------------------------------------------------------------
 
 async def test_budget_reacts_instead_of_answering(tmp_path, monkeypatch):
