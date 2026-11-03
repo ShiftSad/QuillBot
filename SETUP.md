@@ -45,13 +45,13 @@ cp .env.example .env
 | Variable           | Description                                                  |
 |--------------------|--------------------------------------------------------------|
 | `BOT_TOKEN`        | Your Discord bot token. The bot **will not start** without it. |
-| `OPENROUTER_API_KEY` | API key from OpenRouter. Required for `/ask`, `/analyze`, RAG indexing, and follow-up conversations. If not set, the `DocsRAG` and `LogAnalyzer` AI features are disabled. |
+| `OPENROUTER_API_KEY` | API key from OpenRouter. Required for every AI feature: conversations (`/chat`, `/ask`, mentions, replies), `/analyze`, Spark, summaries and RAG indexing. |
 
 ### Optional — AI Models
 
 | Variable         | Default                        | Description                                  |
 |------------------|--------------------------------|----------------------------------------------|
-| `CHAT_MODEL`     | `google/gemini-2.5-flash-lite` | LLM model used for `/ask` and `/analyze`.    |
+| `CHAT_MODEL`     | `qwen/qwen3.6-plus` | LLM model used for conversations and `/analyze`. |
 | `EMBEDDING_MODEL`| `qwen/qwen3-embedding-8b`     | Model used to embed documentation chunks.    |
 | `RERANK_MODEL`   | `cohere/rerank-4-fast`         | Model used to rerank search results.         |
 
@@ -61,10 +61,13 @@ cp .env.example .env
 
 | Variable       | Default | Description                                         |
 |----------------|---------|-----------------------------------------------------|
-| `COOLDOWN_RATE`| `1`     | Number of command uses allowed per cooldown window.  |
+| `CHAT_USER_BUDGET` / `CHAT_USER_BUDGET_WINDOW` | `8` / `300` | Answered conversation turns per person per window (seconds). Over it the bot reacts ⏳ instead of answering. |
+| `CHAT_GUILD_BUDGET` / `CHAT_GUILD_BUDGET_WINDOW` | `150` / `3600` | Answered turns per server per window, monitor runs included. |
+| `CHAT_BURST_SECONDS` | `2.5` | Quick consecutive messages from one person are answered together once they've been quiet this long. |
+| `COOLDOWN_RATE`| `1`     | Uses allowed per cooldown window of `/analyze`, `/spark`, `/resumo`, `/wrapped`. |
 | `COOLDOWN_PER` | `30`    | Cooldown window in seconds (per user).               |
 
-These apply to `/ask` and `/analyze`. Users who exceed the limit receive an ephemeral "wait X seconds" message.
+Users who exceed a slash-command cooldown receive an ephemeral "wait X seconds" message.
 
 ### Optional — API Request Logging
 
@@ -187,14 +190,15 @@ python main.py
 
 On first start the bot will:
 1. Validate that `BOT_TOKEN` is set (exits immediately if not)
-2. Load all cogs in order: `log_analyzer` → `commands` → `plugins` → `docs_rag`
-3. Index documentation from all `DOC_SOURCES` (if no cached vectors exist)
-4. Sync slash commands with Discord
-5. Start the periodic reindex loop
+2. Build the shared services (`bot.services`) and load the `/config` settings
+3. Load all cogs; each registers its tools and its part of the message router
+4. Index documentation from all `DOC_SOURCES` (if no cached vectors exist)
+5. Sync slash commands with Discord
+6. Start the periodic reindex loop, history backfill, scheduler, episode worker and automatic Wrapped
 
-### Cog load order
+### Message routing
 
-The load order in `main.py` matters because both `LogAnalyzer` and `DocsRAG` register `on_message` listeners. The `LogAnalyzer` listener (pattern matching) runs first, followed by `DocsRAG` (follow-up replies). Do not reorder without reviewing listener interactions.
+Every message goes through one router (`core/router.py`): passive observers (history indexing, log and Spark detection) run concurrently, then the chat engine and monitors are offered the message in that order. Cog load order doesn't matter.
 
 ---
 
@@ -202,7 +206,12 @@ The load order in `main.py` matters because both `LogAnalyzer` and `DocsRAG` reg
 
 | Command     | Description                                         | Requires AI |
 |-------------|-----------------------------------------------------|:-----------:|
+| `/chat`     | Talk to the bot (same as mentioning it)              | Yes         |
 | `/ask`      | Ask a question answered from indexed documentation  | Yes         |
+| `/resumo`   | Summarize what happened in a channel                 | Yes         |
+| `/wrapped`  | Server recap: who talked most, channels, emojis…     | Optional**  |
+| `/config`   | Server and channel settings (Manage Server)          | No          |
+| `/memory`, `/monitor`, `/schedule` | Memories, standing triggers, scheduled tasks | Yes |
 | `/analyze`  | Analyze a server log with AI (mclo.gs, pastebin, or file) | Yes   |
 | `/docs`     | Search docs or get the documentation link           | No*         |
 | `/plugin`   | Search for a plugin on Modrinth, Hangar, SpigotMC   | No          |
@@ -215,6 +224,7 @@ The load order in `main.py` matters because both `LogAnalyzer` and `DocsRAG` reg
 | `/help`     | List all available commands (auto-generated)         | No          |
 
 *`/docs` with a query delegates to RAG search if available, otherwise shows a link.
+**The numbers come from the history index; the AI only writes the intro.
 
 ---
 
@@ -225,7 +235,8 @@ The bot automatically monitors messages for:
 - **mclo.gs / pastebin.com links** — reacts with 👀, fetches the log, and matches known error patterns
 - **.log / .txt file attachments** — reads the file, matches patterns, and uploads to mclo.gs for easy sharing
 - **Known Minecraft error messages** — replies with targeted troubleshooting advice
-- **Reply-based follow-ups** — reply to a `/ask` response to continue the conversation
+- **Conversations** — @mentions, replies to the bot, messages in its threads and its name ("quill, …"); quick consecutive messages are answered together (see README → Conversations)
+- **Edits and deletes** — deleting a message the bot answered deletes the answer; editing it shortly after re-answers it
 
 ---
 
@@ -237,11 +248,16 @@ QuillBot/
 ├── config.py           # Centralized configuration (env vars, doc sources)
 ├── main.py             # Bot entrypoint, cog loading, command sync
 ├── requirements.txt    # Python dependencies
+├── core/               # Shared machinery: LLM client, tool registry, router, chat engine, delivery…
 ├── cogs/
+│   ├── chat.py         # /chat, /ask, conversations, edits/deletes, episodes
 │   ├── commands.py     # Utility slash commands (/docs, /help, /flags, etc.)
-│   ├── docs_rag.py     # RAG pipeline: indexing, search, /ask, /reindex
+│   ├── server_config.py# /config
+│   ├── wrapped.py      # /wrapped and automatic recaps
+│   ├── docs_rag.py     # RAG pipeline: indexing, search, /reindex, search_docs tool
 │   ├── log_analyzer.py # Log analysis: pattern matching, /analyze, AI analysis
-│   └── plugins.py      # External API commands: /plugin, /status, /changelog
+│   ├── plugins.py      # External API commands: /plugin, /status, /changelog
+│   └── …               # memory, history_rag, monitors, scheduler, summary, spark (see README)
 └── responses/
     └── errors.py       # Known Minecraft error patterns and responses
 ```

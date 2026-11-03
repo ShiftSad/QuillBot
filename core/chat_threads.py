@@ -12,7 +12,7 @@ The thread is opened on the message that asked, so the channel keeps only that
 message with the thread under it. A conversation that moved keeps answering in
 its thread, even when someone continues it from the channel. Inside a thread
 the bot opened, every message reaches the bot without a mention (see
-``Commands.on_message``); those carry ``UNPROMPTED_HEADER`` and the model may
+``core.chat_engine``); those carry ``UNPROMPTED_HEADER`` and the model may
 stay silent with ``[NO_REPLY]`` when people there talk among themselves.
 """
 
@@ -78,15 +78,18 @@ OPEN_THREAD_TOOL = {
 }
 
 
-def thread_blocker(channel: Any) -> str | None:
+def thread_blocker(channel: Any, mode: str | None = None) -> str | None:
     """Why the bot can't open a thread for an answer in *channel*; ``None`` when it can.
 
     Only text (and announcement) channels have message threads; threads, forum
-    posts, voice-channel chats and DMs answer in place. The reason is told to
-    the model when it asks for a thread, so it can tell people what's wrong.
+    posts, voice-channel chats and DMs answer in place, and so do channels
+    whose ``threads`` setting (*mode*) is ``never``. The reason is told to the
+    model when it asks for a thread, so it can tell people what's wrong.
     """
     if not CHAT_THREADS_ENABLED:
         return 'as threads estão desativadas na configuração do bot'
+    if mode == 'never':
+        return 'neste canal as respostas ficam no canal (configuração do servidor)'
     if isinstance(channel, discord.Thread):
         return 'a conversa já está numa thread'
     if not isinstance(channel, discord.TextChannel):
@@ -105,16 +108,20 @@ def thread_blocker(channel: Any) -> str | None:
     return f'falta ao bot a permissão {names} neste canal (um admin precisa conceder)'
 
 
-def can_open_thread(channel: Any) -> bool:
+def can_open_thread(channel: Any, mode: str | None = None) -> bool:
     """Whether the bot can open a thread for an answer in *channel*."""
-    return thread_blocker(channel) is None
+    return thread_blocker(channel, mode) is None
 
 
-def thread_due(channel: Any, turn: int) -> bool:
-    """Whether turn number *turn* of a conversation in *channel* moves it to a thread."""
-    if not CHAT_THREADS_ENABLED:
+def thread_due(channel: Any, turn: int, mode: str | None = None) -> bool:
+    """Whether turn number *turn* of a conversation in *channel* moves it to a thread.
+
+    *mode* is the channel's ``threads`` setting (``auto``/``always``/``never``);
+    without one, channels in ``CHAT_THREAD_CHANNELS`` count as ``always``.
+    """
+    if not CHAT_THREADS_ENABLED or mode == 'never':
         return False
-    if getattr(channel, 'id', None) in CHAT_THREAD_CHANNELS:
+    if mode == 'always' or (mode is None and getattr(channel, 'id', None) in CHAT_THREAD_CHANNELS):
         return True
     return CHAT_THREAD_AFTER_TURNS > 0 and turn >= CHAT_THREAD_AFTER_TURNS
 

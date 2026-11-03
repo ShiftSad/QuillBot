@@ -235,7 +235,7 @@ async def persist_attachment(attachment: Any) -> str | None:
     instead of re-downloading — channel context re-reads the same recent
     messages on every mention. Any object with ``id`` and ``async read()``
     works the same way (stickers, link embeds and emoji sheets from
-    :mod:`cogs.message_media`).
+    :mod:`core.message_media`).
     """
     att_id = getattr(attachment, 'id', None)
     if att_id is not None:

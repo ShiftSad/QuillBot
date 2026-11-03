@@ -1,9 +1,10 @@
 """Persistent scheduler — one-shot and recurring (cron) tasks for the bot.
 
 Each scheduled job stores a free-text prompt that the LLM acts on when the job
-fires, posting its response to a target channel.  This reuses the same
-``_run_chat`` pipeline as ``/chat``, so scheduled tasks have the full toolset
-(web search, memory, channel history, etc.).
+fires, posting its response to a target channel.  It runs through the chat
+engine (``bot.services.chat.run_task``) like any conversation, so scheduled
+tasks have the full toolset (web search, memory, channel history, etc.), and
+replying to the post continues it as a conversation.
 
 Schedule types
 --------------
@@ -29,14 +30,16 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.utils import BR_TZ, PaginatedEmbedView, ping_send_kwargs
 from config import (
+    BR_TZ,
     SCHEDULER_DB_PATH,
     SCHEDULER_ENABLED,
     SCHEDULER_LOOP_INTERVAL,
     SCHEDULER_MAX_JOBS_PER_GUILD,
     SCHEDULER_MAX_PROMPT,
 )
+from core.tools import Tool
+from core.ui import PaginatedEmbedView
 
 logger = logging.getLogger(__name__)
 
@@ -488,6 +491,7 @@ class Scheduler(commands.Cog, name='Scheduler'):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.services = getattr(bot, 'services', None)
         self.store = SchedulerStore(SCHEDULER_DB_PATH)
         self._loop_task: asyncio.Task | None = None
         self._fire_tasks: set[asyncio.Task] = set()
@@ -498,8 +502,10 @@ class Scheduler(commands.Cog, name='Scheduler'):
         if n:
             logger.info("[scheduler] recomputed next_fire for %d cron job(s)", n)
         self._loop_task = asyncio.get_running_loop().create_task(self._run_loop())
+        self.services.tools.register(*scheduler_tools(self))
 
     async def cog_unload(self):
+        self.services.tools.unregister(*(t['function']['name'] for t in SCHEDULER_TOOLS))
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
             try:
@@ -567,8 +573,8 @@ class Scheduler(commands.Cog, name='Scheduler'):
 
     async def _run_scheduled_prompt(self, job: dict, guild: discord.Guild, channel):
         """Run the LLM on the job's prompt and post the result to the channel."""
-        commands_cog = self.bot.get_cog('Commands')
-        if commands_cog is None or not commands_cog.client:
+        chat = self.services.chat
+        if chat is None or not self.services.llm.available:
             try:
                 await channel.send('⚠️ Tarefa agendada não pode executar: cliente de IA indisponível.')
             except discord.HTTPException:
@@ -579,31 +585,12 @@ class Scheduler(commands.Cog, name='Scheduler'):
         prompt = (
             f"[Tarefa agendada por {job['created_by_name']}]\n"
             f"Esta é uma tarefa automática disparada pelo agendador. "
-            f"Aja naturalmente conforme a instrução abaixo:\n\n{job['prompt']}"
+            f"Aja naturalmente conforme a instrução abaixo. Se a instrução só pedir uma "
+            f"mensagem sob alguma condição e ela não se cumprir, responda exatamente [NO_REPLY].\n\n"
+            f"{job['prompt']}"
         )
-
         try:
-            async with channel.typing():
-                answer, embeds, sources, _capture = await commands_cog._run_chat(
-                    prompt,
-                    user=owner,
-                    guild=guild,
-                    channel=channel,
-                    created_at=datetime.datetime.now(BR_TZ),
-                )
-            if embeds:
-                send_kwargs = ping_send_kwargs(answer, guild)
-                send_kwargs['embed'] = embeds[0]
-                if len(embeds) > 1:
-                    send_kwargs['view'] = PaginatedEmbedView(embeds)
-                await channel.send(**send_kwargs)
-            elif answer:
-                await channel.send(
-                    answer[:2000],
-                    allowed_mentions=discord.AllowedMentions(
-                        users=True, roles=False, everyone=False,
-                    ),
-                )
+            await chat.run_task(prompt, guild=guild, channel=channel, owner=owner)
         except Exception:
             logger.exception("[scheduler] LLM execution failed for job %s", job['id'])
             try:
@@ -1210,6 +1197,35 @@ SCHEDULE_DELETE_TOOL = {
 }
 
 SCHEDULER_TOOLS = [SCHEDULE_CREATE_TOOL, SCHEDULE_LIST_TOOL, SCHEDULE_DELETE_TOOL]
+
+
+def _tool_status(name: str, args: dict) -> str:
+    if name == 'schedule_create':
+        return f"⏰ Agendando: *{str(args.get('prompt', ''))[:40]}*"
+    if name == 'schedule_list':
+        return '⏰ Listando tarefas agendadas…'
+    return f'⏰ Removendo tarefa #{args.get("id", "?")}'
+
+
+def scheduler_tools(cog: Scheduler) -> list[Tool]:
+    """The schedule_* tools bound to *cog*; tasks post in the channel of the conversation."""
+
+    async def run(ctx, args, *, name):
+        if ctx.guild is None:
+            return 'Agendador requer estar em um servidor.'
+        return await cog.exec_tool(
+            name, args, guild=ctx.guild, actor_name=ctx.actor_name,
+            requester=ctx.user, channel=ctx.channel,
+        )
+
+    return [
+        Tool(
+            t['function']['name'], t,
+            lambda ctx, args, _n=t['function']['name']: run(ctx, args, name=_n),
+            lambda args, ctx, _n=t['function']['name']: _tool_status(_n, args),
+        )
+        for t in SCHEDULER_TOOLS
+    ]
 
 
 async def setup(bot: commands.Bot):

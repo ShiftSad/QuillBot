@@ -224,7 +224,9 @@ This tool was considered to surface known plugin performance bugs. Without `web_
 
 ---
 
-### 3.6 Per-Channel Feature Configuration ⚡ Medium
+### 3.6 Per-Channel Feature Configuration ⚡ Medium ✅ Implemented (partially)
+
+`/config` (`cogs/server_config.py`, `core/settings.py`) sets per channel — or as a server default — when the bot converses (`respond`), name calls, threads, reply format, passive log/Spark detection (`log_detection`) and channel instructions. Restricting individual slash commands to channels is still open.
 
 **Problem:** All bot features are globally active. Server admins cannot disable passive log detection in off-topic channels or restrict `/ask` to specific support channels.
 
@@ -249,7 +251,9 @@ if not OPENROUTER_API_KEY:
     logger.critical("OPENROUTER_API_KEY is not set — all AI commands will be disabled")
 ```
 
-### 4.2 No Exponential Backoff on LLM / HTTP Calls ⚠️ Medium
+### 4.2 No Exponential Backoff on LLM / HTTP Calls ⚠️ Medium ✅ Implemented (LLM calls)
+
+`core/llm.py:create_chat_completion` retries 429, timeouts, connection errors and 5xx (`LLM_RETRY_ATTEMPTS`, `LLM_RETRY_BASE_DELAY`, honoring `Retry-After`). Plain aiohttp calls (GitHub, plugin APIs, mclo.gs) still fail fast.
 
 Only `RateLimitError` is caught explicitly on LLM calls. `asyncio.TimeoutError`, `aiohttp.ServerConnectionError`, and other transient failures return an error immediately with no retry. Under brief API instability the bot fails every request.
 
@@ -321,7 +325,7 @@ The current 18 patterns in `responses/errors.py` cover common cases. The followi
 1. Add `pytest` and `pytest-asyncio` to `requirements.txt`
 2. Refactor `tests/test_spark_parser.py` into proper pytest tests with assertions
 3. Add tests for:
-   - `cogs/utils.py` — `truncate_safe` and `split_response` edge cases (empty string, exact boundary, unicode)
+   - `core/discord_text.py` — `truncate_safe` and `split_response` edge cases (empty string, exact boundary, unicode)
    - `responses/errors.py` — pattern matching against known log snippets
    - `cogs/plugin_apis.py` — URL construction and response parsing with mock data
    - `cogs/spark_parser.py` — `build_summary()` and `build_detail()` with fixture JSON

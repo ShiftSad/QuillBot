@@ -4,9 +4,9 @@ import asyncio
 import datetime
 from types import SimpleNamespace
 
-from cogs import conversation_store as cs
-from cogs import utils
-from cogs.conversation_store import build_current_message
+from core import conversations as cs
+from core import context as utils
+from core.conversations import build_current_message
 
 
 class FakeChannel:

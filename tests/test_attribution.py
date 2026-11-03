@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from cogs.conversation_store import (
+from core.conversations import (
     author_stamp,
     build_conversation_block,
     build_current_message,

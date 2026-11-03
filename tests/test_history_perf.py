@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from cogs.history_rag import HistoryRAG
-from cogs.local_inference import run_local_model
+from core.local_inference import run_local_model
 
 from helpers import check
 

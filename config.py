@@ -3,10 +3,20 @@
 import os
 import sys
 from typing import Final
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _flag(name: str, default: str = 'true') -> bool:
+    return os.getenv(name, default).strip().lower() in ('1', 'true', 'yes')
+
+
+# The community's clock: dates shown to people and to the model, cron jobs,
+# summaries and the Wrapped schedule all use it.
+BR_TZ: Final = ZoneInfo('America/Sao_Paulo')
 
 # --- Required ---
 BOT_TOKEN: Final[str | None] = os.getenv('BOT_TOKEN')
@@ -34,6 +44,12 @@ LLM_MAX_TOKENS: Final[int] = int(os.getenv('LLM_MAX_TOKENS', '8192'))
 # Reasoning effort sent on every chat completion (minimal | low | medium | high).
 # Empty omits the parameter — providers/models that don't accept it 400 otherwise.
 LLM_REASONING_EFFORT: Final[str] = os.getenv('LLM_REASONING_EFFORT', '').strip().lower()
+
+# Transient LLM failures (429, timeouts, connection errors, 5xx) are retried
+# this many times in total, waiting LLM_RETRY_BASE_DELAY * 2**n seconds between
+# attempts (or the provider's Retry-After, capped at 10s).
+LLM_RETRY_ATTEMPTS: Final[int] = max(1, int(os.getenv('LLM_RETRY_ATTEMPTS', '3')))
+LLM_RETRY_BASE_DELAY: Final[float] = float(os.getenv('LLM_RETRY_BASE_DELAY', '1.0'))
 
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
@@ -124,6 +140,40 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # the last CHANNEL_CONTEXT_MESSAGES channel messages (like replying to it).
 CHAT_MENTION_CONTINUE_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_CONTINUE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
+# The bot also answers when it is called by name without an @ ("quill, o que
+# acha?"). Names: its server nickname, its username, those without a trailing
+# "bot", plus CHAT_NAME_ALIASES and the server's `aliases` setting (/config).
+CHAT_NAME_TRIGGER_ENABLED: Final[bool] = _flag('CHAT_NAME_TRIGGER_ENABLED')
+CHAT_NAME_ALIASES: Final[tuple[str, ...]] = tuple(
+    a.strip() for a in os.getenv('CHAT_NAME_ALIASES', '').split(',') if a.strip()
+)
+
+# --- Replies ---
+# How answers are sent: `plain` messages, `embed`s, or `auto` (plain, except
+# Spark reports, channel summaries and answers longer than
+# CHAT_PLAIN_MAX_CHARS, which go in embeds). Overridable per channel (/config).
+CHAT_REPLY_STYLE: Final[str] = os.getenv('CHAT_REPLY_STYLE', 'auto').strip().lower()
+CHAT_PLAIN_MAX_CHARS: Final[int] = int(os.getenv('CHAT_PLAIN_MAX_CHARS', '2000'))
+
+# --- Bursts and budget ---
+# People type in bursts ("ei" / "sabe aquele erro" / "de ontem?"): the bot waits
+# until the person has been quiet this many seconds and answers all of it as
+# one turn. Messages sent while it is answering become the next turn.
+CHAT_BURST_SECONDS: Final[float] = float(os.getenv('CHAT_BURST_SECONDS', '2.5'))
+# Cost guard instead of a per-message cooldown: at most N answered turns per
+# person per window, and per server per window (0 disables each). Over budget,
+# the bot reacts with ⏳ instead of answering.
+CHAT_USER_BUDGET: Final[int] = int(os.getenv('CHAT_USER_BUDGET', '8'))
+CHAT_USER_BUDGET_WINDOW: Final[float] = float(os.getenv('CHAT_USER_BUDGET_WINDOW', '300'))
+CHAT_GUILD_BUDGET: Final[int] = int(os.getenv('CHAT_GUILD_BUDGET', '150'))
+CHAT_GUILD_BUDGET_WINDOW: Final[float] = float(os.getenv('CHAT_GUILD_BUDGET_WINDOW', '3600'))
+
+# --- Edits and deletes ---
+# Deleting a message the bot answered deletes the answer too; editing it within
+# this many seconds of the answer re-answers it (0 never re-answers).
+CHAT_DELETE_WITH_TRIGGER: Final[bool] = _flag('CHAT_DELETE_WITH_TRIGGER')
+CHAT_EDIT_WINDOW_SECONDS: Final[float] = float(os.getenv('CHAT_EDIT_WINDOW_SECONDS', '60'))
+
 # --- Chat threads (move long or off-topic conversations out of the channel) ---
 CHAT_THREADS_ENABLED: Final[bool] = os.getenv('CHAT_THREADS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 # A conversation moves into a thread on this turn (3 = the second follow-up); 0 never moves it.
@@ -205,6 +255,22 @@ MEMORY_SEMANTIC_MIN_SCORE: Final[float] = float(os.getenv('MEMORY_SEMANTIC_MIN_S
 MEMORY_DEDUPE_THRESHOLD: Final[float] = float(os.getenv('MEMORY_DEDUPE_THRESHOLD', '0.85'))
 # Legacy lore encyclopedia — kept only as the one-time migration source for memory.db
 LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
+
+# --- Episodes (summaries of past conversations kept as memories) ---
+# When a conversation expires, a cheap model summarizes it into one "conversa"
+# memory per participant, so later conversations can pick up where it left off.
+EPISODES_ENABLED: Final[bool] = _flag('EPISODES_ENABLED')
+EPISODES_MODEL: Final[str] = os.getenv('EPISODES_MODEL') or os.getenv('SUMMARY_MODEL') or CHAT_MODEL
+EPISODES_PER_USER: Final[int] = int(os.getenv('EPISODES_PER_USER', '20'))
+EPISODES_INTERVAL_SECONDS: Final[float] = float(os.getenv('EPISODES_INTERVAL_SECONDS', '300'))
+
+# --- Server and channel settings (/config) ---
+SETTINGS_DB_PATH: Final[str] = os.getenv('SETTINGS_DB_PATH', 'data/settings.db')
+
+# --- Server Wrapped (/wrapped, server_wrapped tool, automatic recaps) ---
+WRAPPED_ENABLED: Final[bool] = _flag('WRAPPED_ENABLED')
+# Hour (Brasília time) automatic recaps are posted: Mondays (weekly) or the 1st (monthly).
+WRAPPED_HOUR: Final[int] = int(os.getenv('WRAPPED_HOUR', '10'))
 
 # --- Scheduler (cron / one-shot delayed tasks) ---
 SCHEDULER_ENABLED: Final[bool] = os.getenv('SCHEDULER_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')

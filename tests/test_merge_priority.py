@@ -10,7 +10,7 @@ on the developer's .env.
 from types import SimpleNamespace
 
 import config
-from cogs.utils import create_chat_completion
+from core.llm import create_chat_completion
 from config import chat_priority_extra_body
 
 from helpers import as_stream, check

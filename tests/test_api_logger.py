@@ -103,7 +103,8 @@ async def main():
     # only streams (create_chat_completion); the fake endpoint rejects anything else.
     from openai import AsyncOpenAI, BadRequestError
 
-    from cogs.utils import create_chat_completion, serialize_trajectory
+    from core.llm import create_chat_completion
+    from core.tool_loop import serialize_trajectory
     client = AsyncOpenAI(base_url=base + '/v1', api_key='test-key', max_retries=0)
     try:
         await client.chat.completions.create(model='sdk/model', messages=[{'role': 'user', 'content': 'x'}])

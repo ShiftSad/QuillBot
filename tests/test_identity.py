@@ -1,7 +1,7 @@
 """build_identity_block: the model knows its own name/id and the guild it is in."""
 from types import SimpleNamespace as NS
 
-from cogs.utils import build_identity_block
+from core.discord_text import build_identity_block
 
 BOT = NS(id=900000000000000001, name='quillbot', display_name='Quill')
 

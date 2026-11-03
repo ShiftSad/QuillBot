@@ -18,11 +18,12 @@ except ImportError:
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from cogs.local_inference import run_local_model
-from cogs.utils import format_chunk_line, format_message_line, message_content_text, render_search_results
+from core.discord_text import format_chunk_line, format_message_line, message_content_text, render_search_results
+from core.local_inference import run_local_model
+from core.tools import Tool
 
 from config import (
-    EMBEDDING_MODEL,
+    BR_TZ,
     EMBEDDING_PROVIDER,
     HISTORY_BACKFILL_LIMIT,
     HISTORY_DB_PATH,
@@ -41,11 +42,10 @@ from config import (
     HISTORY_RRF_K,
     HISTORY_SQL_MAX_ROWS,
     HISTORY_SQL_TIMEOUT_SECONDS,
+    HISTORY_SQL_TOOL_ENABLED,
     HISTORY_TIME_DECAY_LAMBDA,
     HISTORY_WINDOW_OVERLAP,
     HISTORY_WINDOW_SIZE,
-    LOCAL_EMBEDDING_DEVICE,
-    LOCAL_EMBEDDING_MODEL,
     LOCAL_RERANK_DEVICE,
     LOCAL_RERANK_MODEL,
     OPENAI_API_KEY,
@@ -55,12 +55,8 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-BR_TZ = None
-try:
-    from zoneinfo import ZoneInfo
-    BR_TZ = ZoneInfo("America/Sao_Paulo")
-except Exception:
-    pass
+OBSERVER_NAME = 'history-ingest'
+
 
 def _parse_dt(s: str | None) -> datetime.datetime | None:
     if not s:
@@ -253,21 +249,12 @@ def _aggregate_authors(rows) -> dict[tuple[int, str], dict]:
 class HistoryRAG(commands.Cog, name="HistoryRAG"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.client = None
-        self._local_model = None
-        self._local_dim = None
+        self.services = getattr(bot, 'services', None)
         self._local_rerank_model = None
         try:
             self._query_cache = TTLCache(maxsize=max(50, HISTORY_QUERY_CACHE_SIZE), ttl=300)  # type: ignore
         except Exception:
             self._query_cache = {}  # type: ignore
-        if EMBEDDING_PROVIDER != "local":
-            try:
-                from openai import AsyncOpenAI
-                api_key = OPENAI_API_KEY or "not-needed"
-                self.client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=api_key)
-            except Exception:
-                logger.exception("Failed to init OpenAI client for HistoryRAG")
         self._chunks: dict[int, list[dict]] = {}
         self._matrices: dict[int, np.ndarray | None] = {}
         # guild_id -> buffer with spare rows; _matrices[gid] is a prefix view of it.
@@ -283,17 +270,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         self._worker_task: asyncio.Task | None = None
         self._fts_health_checked = False
 
-    def _get_local_model(self):
-        if self._local_model is not None:
-            return self._local_model
-        from sentence_transformers import SentenceTransformer
-        logger.info("Loading local history embedding model %s", LOCAL_EMBEDDING_MODEL)
-        self._local_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL, device=LOCAL_EMBEDDING_DEVICE)
-        test = self._local_model.encode(["test"], normalize_embeddings=True)
-        self._local_dim = test.shape[1] if hasattr(test, "shape") else len(test[0])
-        logger.info("History local model dim=%s", self._local_dim)
-        return self._local_model
-
     def _get_local_reranker(self):
         if self._local_rerank_model is not None:
             return self._local_rerank_model
@@ -308,17 +284,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         return self._local_rerank_model
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        if EMBEDDING_PROVIDER == "local":
-            emb = await run_local_model(
-                lambda: self._get_local_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
-            )
-            if hasattr(emb, "tolist"):
-                return emb.tolist()
-            return [list(e) for e in emb]
-        if not self.client:
-            raise RuntimeError("OpenAI client not initialized for history embeddings")
-        resp = await self.client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-        return [d.embedding for d in resp.data]
+        return await self.services.llm.embed(texts)
 
     def _db_path(self) -> str:
         return HISTORY_DB_PATH
@@ -451,6 +417,19 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 PRIMARY KEY (guild_id, author_id)
             )""")
             con.execute("CREATE INDEX IF NOT EXISTS idx_authors_guild ON authors(guild_id)")
+            # One row per (message, emoji, person) reaction, recorded as they
+            # happen (no backfill) — feeds Wrapped and sql_history.
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS reactions (
+                guild_id INTEGER NOT NULL,
+                channel_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                PRIMARY KEY (msg_id, emoji, user_id)
+            )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_reactions_guild_ts ON reactions(guild_id, ts)")
             con.commit()
         finally:
             con.close()
@@ -474,7 +453,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 logger.warning("DB embedding blob mismatch guild %s, skipping DB load", guild_id)
                 return False
             dim = emb_len // 4
-            if EMBEDDING_PROVIDER == "local" and self._local_dim and dim != self._local_dim:
+            local_dim = getattr(getattr(self.services, 'llm', None), 'local_dim', None)
+            if EMBEDDING_PROVIDER == "local" and local_dim and dim != local_dim:
                 logger.warning("DB dim mismatch guild %s, skipping DB load", guild_id)
                 return False
             chunks = []
@@ -771,11 +751,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         if not HISTORY_ENABLED:
             logger.info("HistoryRAG disabled via HISTORY_ENABLED=false")
             return
-        if EMBEDDING_PROVIDER == "local":
-            try:
-                await run_local_model(self._get_local_model)
-            except Exception:
-                logger.warning("HistoryRAG local model failed, will fallback to remote if possible")
+        self.services.history = self
+        self.services.router.observe(OBSERVER_NAME, self.ingest)
+        self.services.tools.register(*history_tools(self))
+        await self.services.llm.warm_up()
         try:
             await asyncio.to_thread(self._ensure_db)
         except Exception:
@@ -796,6 +775,11 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         self.bot.loop.create_task(self._background_backfill_all())
 
     async def cog_unload(self):
+        if self.services is not None:
+            self.services.router.remove(OBSERVER_NAME)
+            self.services.tools.unregister(*HISTORY_TOOL_NAMES)
+            if self.services.history is self:
+                self.services.history = None
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -1078,8 +1062,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         except Exception:
             logger.exception("Failed persisting history batch guild %s", gid)
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
+    async def ingest(self, message: discord.Message):
+        """Router observer: queue every new message for indexing."""
         if not HISTORY_ENABLED or not message.guild:
             return
         if HISTORY_EXCLUDE_BOTS and message.author.bot:
@@ -1176,6 +1160,103 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     await asyncio.to_thread(_purge_guild)
                 except Exception:
                     pass
+
+    # --- Reactions (recorded live for Wrapped and sql_history) ---
+
+    def _reaction_write(self, sql: str, params: tuple) -> None:
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()
+
+    @staticmethod
+    def _emoji_key(emoji) -> str:
+        if getattr(emoji, 'id', None):
+            return f":{emoji.name}:"
+        return str(emoji)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if not HISTORY_ENABLED or not payload.guild_id:
+            return
+        member = getattr(payload, 'member', None)
+        if member is not None and member.bot:
+            return
+        try:
+            await asyncio.to_thread(
+                self._reaction_write,
+                'INSERT OR IGNORE INTO reactions (guild_id, channel_id, msg_id, emoji, user_id, ts) VALUES (?,?,?,?,?,?)',
+                (payload.guild_id, str(payload.channel_id), str(payload.message_id),
+                 self._emoji_key(payload.emoji), str(payload.user_id),
+                 datetime.datetime.now(datetime.timezone.utc).isoformat()),
+            )
+        except Exception:
+            logger.exception("Failed to record reaction on %s", payload.message_id)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if not HISTORY_ENABLED or not payload.guild_id:
+            return
+        try:
+            await asyncio.to_thread(
+                self._reaction_write,
+                'DELETE FROM reactions WHERE msg_id=? AND emoji=? AND user_id=?',
+                (str(payload.message_id), self._emoji_key(payload.emoji), str(payload.user_id)),
+            )
+        except Exception:
+            logger.exception("Failed to remove reaction on %s", payload.message_id)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
+        if not HISTORY_ENABLED or not payload.guild_id:
+            return
+        await asyncio.to_thread(self._reaction_write, 'DELETE FROM reactions WHERE msg_id=?', (str(payload.message_id),))
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_clear_emoji(self, payload: discord.RawReactionClearEmojiEvent):
+        if not HISTORY_ENABLED or not payload.guild_id:
+            return
+        await asyncio.to_thread(
+            self._reaction_write, 'DELETE FROM reactions WHERE msg_id=? AND emoji=?',
+            (str(payload.message_id), self._emoji_key(payload.emoji)),
+        )
+
+    def _reaction_rows(self, guild_id: int, since_iso: str, until_iso: str) -> list[tuple]:
+        path = self._db_path()
+        if not os.path.exists(path):
+            return []
+        con = sqlite3.connect(path, timeout=30)
+        try:
+            return con.execute(
+                'SELECT msg_id, emoji, user_id FROM reactions WHERE guild_id=? AND ts >= ? AND ts < ?',
+                (guild_id, since_iso, until_iso),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            con.close()
+
+    async def wrapped_stats(self, guild_id: int, since: datetime.datetime, until: datetime.datetime) -> dict:
+        """Activity recap of *guild_id* between *since* and *until* (aware datetimes).
+
+        Messages come from the index (bots excluded unless HISTORY_EXCLUDE_BOTS
+        is off); reactions from the reactions table, which only holds what
+        happened since it started being recorded.
+        """
+        if guild_id not in self._chunks:
+            self._chunks[guild_id] = []
+            self._matrices[guild_id] = None
+            self._msg_index[guild_id] = {}
+            await asyncio.to_thread(self._load_guild, guild_id)
+        chunks = list(self._chunks.get(guild_id) or [])
+        reaction_rows = await asyncio.to_thread(
+            self._reaction_rows, guild_id,
+            since.astimezone(datetime.timezone.utc).isoformat(),
+            until.astimezone(datetime.timezone.utc).isoformat(),
+        )
+        return compute_wrapped(chunks, reaction_rows, since, until)
 
     async def _resolve_author(self, guild_id: int, author_id: str | None, author_name: str | None) -> list[str]:
         if author_id:
@@ -1951,6 +2032,460 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         except discord.HTTPException:
             pass
         await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Wrapped statistics
+# ---------------------------------------------------------------------------
+
+_CUSTOM_EMOJI_TEXT_RE = re.compile(r'(?<![\w:]):([A-Za-z0-9_~]{2,32}):(?![\w:])')
+_UNICODE_EMOJI_RE = re.compile('[\U0001F300-\U0001FAFF\u2600-\u27BF]')
+_WEEKDAYS = ('segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado', 'domingo')
+
+
+def _chunk_dt(chunk: dict) -> datetime.datetime | None:
+    try:
+        dt = datetime.datetime.fromisoformat(str(chunk.get('ts', '')).replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def compute_wrapped(chunks: list[dict], reaction_rows: list[tuple], since: datetime.datetime, until: datetime.datetime, *, top: int = 5) -> dict:
+    """Recap numbers from indexed messages (*chunks*) and ``(msg_id, emoji, user_id)`` reactions."""
+    by_id = {str(c.get('msg_id')): c for c in chunks}
+    in_range = []
+    for c in chunks:
+        dt = _chunk_dt(c)
+        if dt is not None and since <= dt < until:
+            in_range.append((c, dt))
+    authors: collections.Counter = collections.Counter()
+    labels: dict[str, str] = {}
+    channels: collections.Counter = collections.Counter()
+    hours: collections.Counter = collections.Counter()
+    weekdays: collections.Counter = collections.Counter()
+    pairs: collections.Counter = collections.Counter()
+    emojis: collections.Counter = collections.Counter()
+    for c, dt in in_range:
+        aid = str(c.get('author_id', ''))
+        authors[aid] += 1
+        labels[aid] = str(c.get('author_full') or c.get('author_name') or aid)
+        channels[str(c.get('channel_name') or '?')] += 1
+        local = dt.astimezone(BR_TZ)
+        hours[local.hour] += 1
+        weekdays[local.weekday()] += 1
+        target = by_id.get(str(c.get('reply_to') or ''))
+        if target is not None and str(target.get('author_id')) != aid:
+            tid = str(target.get('author_id'))
+            labels.setdefault(tid, str(target.get('author_full') or tid))
+            pairs[(aid, tid)] += 1
+        content = str(c.get('content') or '')
+        for name in _CUSTOM_EMOJI_TEXT_RE.findall(content):
+            emojis[f':{name}:'] += 1
+        for ch in _UNICODE_EMOJI_RE.findall(content):
+            emojis[ch] += 1
+    per_message: collections.Counter = collections.Counter()
+    reaction_emojis: collections.Counter = collections.Counter()
+    reactors: collections.Counter = collections.Counter()
+    for msg_id, emoji, user_id in reaction_rows:
+        per_message[str(msg_id)] += 1
+        reaction_emojis[emoji] += 1
+        reactors[str(user_id)] += 1
+    most_reacted = []
+    for msg_id, n in per_message.most_common():
+        c = by_id.get(msg_id)
+        if c is None:
+            continue
+        most_reacted.append({
+            'count': n,
+            'author': str(c.get('author_full') or c.get('author_id')),
+            'content': ' '.join(str(c.get('content') or '').split())[:140],
+            'jump_url': c.get('jump_url', ''),
+        })
+        if len(most_reacted) >= 3:
+            break
+    return {
+        'since': since,
+        'until': until,
+        'messages': len(in_range),
+        'active_members': len(authors),
+        'top_authors': [(labels[a], n) for a, n in authors.most_common(top)],
+        'top_channels': channels.most_common(top),
+        'busiest_hour': hours.most_common(1)[0] if hours else None,
+        'busiest_weekday': (_WEEKDAYS[weekdays.most_common(1)[0][0]], weekdays.most_common(1)[0][1]) if weekdays else None,
+        'top_pairs': [(labels.get(a, a), labels.get(b, b), n) for (a, b), n in pairs.most_common(3)],
+        'top_emojis': (emojis + reaction_emojis).most_common(top),
+        'reactions': sum(per_message.values()),
+        'most_reacted': most_reacted,
+    }
+
+
+# ---------------------------------------------------------------------------
+# LLM tools
+# ---------------------------------------------------------------------------
+
+SEARCH_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_history',
+        'description': (
+            'Busca semanticamente no histórico completo do servidor (RAG). '
+            'Use quando o usuário perguntar sobre conversas anteriores, decisões, '
+            'problemas já discutidos, ou contexto que pode estar no chat. Retorna '
+            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local. '
+            'Cada resultado traz channel_id e msg_id — use com get_message_context para expandir o contexto. '
+            'Mensagens do mesmo trecho de conversa são agrupadas em um único resultado. '
+            'Para filtrar por autor conhecendo apenas o nome, resolva o author_id com find_user primeiro.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Consulta em linguagem natural sobre o histórico.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Número de resultados (padrão 5, máximo 12).',
+                },
+                'channel_id': {
+                    'type': 'string',
+                    'description': 'Opcional: restringir busca a um canal específico (ID).',
+                },
+                'author_id': {
+                    'type': 'string',
+                    'description': 'Opcional: filtrar por autor (ID do usuário Discord).',
+                },
+                'author_name': {
+                    'type': 'string',
+                    'description': 'Opcional: filtrar por nome/apelido do autor (busca parcial, ex: "joao").',
+                },
+                'after': {
+                    'type': 'string',
+                    'description': 'Opcional: data inicial ISO (YYYY-MM-DD ou YYYY-MM-DDTHH:MM:SS). Filtra mensagens após esta data.',
+                },
+                'before': {
+                    'type': 'string',
+                    'description': 'Opcional: data final ISO. Filtra mensagens antes desta data.',
+                },
+                'search_mode': {
+                    'type': 'string',
+                    'enum': ['semantic', 'keyword', 'hybrid'],
+                    'description': 'Modo de busca: semantic (embedding), keyword (texto exato), hybrid (0.7 semantic + 0.3 keyword, padrão).',
+                },
+                'sort_by': {
+                    'type': 'string',
+                    'enum': ['relevance', 'recent'],
+                    'description': 'Ordenação: relevance (similaridade) ou recent (mais recentes primeiro).',
+                },
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+GET_USER_STATS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_user_stats',
+        'description': (
+            'Retorna estatísticas de um usuário no histórico: total de mensagens, canais mais ativos, '
+            'horários mais ativos, primeira/última mensagem, média de tamanho. Use para "o que X mais fala?" ou perfil do usuário.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'author_id': {'type': 'string', 'description': 'ID do usuário Discord.'},
+                'author_name': {'type': 'string', 'description': 'Nome/apelido parcial se ID desconhecido.'},
+            },
+            'required': [],
+        },
+    },
+}
+
+COUNT_MENTIONS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'count_mentions',
+        'description': (
+            'Conta menções de um tópico/query no histórico e agrupa por autor ou canal. '
+            'Use para "quem fala mais sobre X?" ou "quantas vezes falamos sobre X?".'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'Tópico/query a contar.'},
+                'group_by': {'type': 'string', 'enum': ['author', 'channel', 'day'], 'description': 'Agrupamento (padrão author).'},
+                'limit': {'type': 'integer', 'description': 'Número de grupos (padrão 10).'},
+                'after': {'type': 'string', 'description': 'Data inicial ISO.'},
+                'before': {'type': 'string', 'description': 'Data final ISO.'},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+GET_MESSAGE_CONTEXT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_message_context',
+        'description': (
+            'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
+            'Use após search_history para expandir o contexto de um resultado relevante. '
+            'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem, desde que combinados '
+            'com o channel_id exibido nos cabeçalhos de resultado/blocos ou com o canal atual. '
+            'Resultados próximos no tempo são agrupados pelo search_history — use esta ferramenta '
+            'para ver as mensagens vizinhas de um cluster.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'message_id': {
+                    'type': 'string',
+                    'description': 'ID da mensagem central.',
+                },
+                'channel_id': {
+                    'type': 'string',
+                    'description': 'ID do canal da mensagem.',
+                },
+                'window': {
+                    'type': 'integer',
+                    'description': 'Janela de contexto (padrão 5, máximo 10).',
+                },
+            },
+            'required': ['message_id', 'channel_id'],
+        },
+    },
+}
+
+FIND_USER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'find_user',
+        'description': (
+            'Resolve um usuário do servidor pelo nome (atual, antigo ou apelido), @handle ou ID. '
+            'Retorna a identidade canônica (author_id), apelidos conhecidos, total de mensagens, '
+            'período de atividade e canais mais ativos. '
+            'Use ANTES de search_history ou get_user_stats quando souber apenas o '
+            'nome da pessoa — passe o author_id retornado como filtro dessas ferramentas. '
+            'Sem query, lista os usuários mais ativos do servidor.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Nome (parcial ok, sem diferenciação de maiúsculas), @handle ou ID do Discord. Omita para listar os mais ativos.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Máximo de usuários (padrão 5, máximo 12).',
+                },
+            },
+            'required': [],
+        },
+    },
+}
+
+SQL_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'sql_history',
+        'description': (
+            'Executa UM SELECT SQL somente-leitura no banco do histórico do servidor '
+            'para perguntas analíticas que o search_history não cobre: contagens exatas, '
+            'agrupamentos, cruzamentos, regex, menções e respostas. '
+            'OBRIGATÓRIO: a consulta deve citar o guild_id do servidor atual e ler apenas '
+            'as tabelas abaixo (leituras da coluna chunks.embedding e qualquer escrita são bloqueadas). '
+            'Sem busca semântica aqui — para "sobre o que falamos" use search_history. '
+            'Esquema: chunks(msg_id, guild_id, channel_id, channel_name, author_id, author_name, '
+            'author_full, content, chunk_text, window_line, window_lines, reply_to, ts ISO-8601 UTC, '
+            'jump_url, embedding BLOB proibido) — 1 linha por mensagem indexada (bots excluídos); '
+            'authors(guild_id, author_id, display_name, handle, full_label, aliases JSON, first_seen, '
+            'last_seen, msg_count); chunks_fts(msg_id, guild_id, chunk_text, content) — índice FTS5; '
+            'reactions(guild_id, channel_id, msg_id, emoji, user_id, ts) — 1 linha por reação, só desde '
+            'que o registro começou. '
+            'Exemplos: top falantes de um tópico: '
+            "\"SELECT c.author_full, COUNT(*) n FROM chunks c JOIN chunks_fts f ON f.msg_id=c.msg_id "
+            "WHERE f.guild_id=123 AND chunks_fts MATCH '\"lag\" AND server' GROUP BY c.author_full ORDER BY n DESC\"; "
+            'menções de usuário: c.content LIKE \'%<@ID>%\' OR c.content LIKE \'%<@!ID>%\'; '
+            'respostas a uma mensagem: c.reply_to=\'MSG_ID\'; respostas em geral: c.reply_to IS NOT NULL; '
+            'por mês: GROUP BY substr(c.ts,1,7); por hora: GROUP BY substr(c.ts,12,2); '
+            "FTS5: MATCH '\"frase exata\" AND (a OR b) NOT c', prefixo 'palavra*'; "
+            'REGEXP(padrão, texto) e REGEXP sempre com re.IGNORECASE; '
+            'data: compare c.ts como texto ISO ou use datetime(c.ts).'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'sql': {
+                    'type': 'string',
+                    'description': 'Um único SELECT (ou WITH ... SELECT) SQLite, já com o filtro guild_id do servidor atual.',
+                },
+            },
+            'required': ['sql'],
+        },
+    },
+}
+
+
+async def exec_history_tool(
+    hist: 'HistoryRAG | None',
+    name: str,
+    args: dict,
+    *,
+    guild: discord.Guild | None,
+) -> str | None:
+    """Run one of the history tools against *hist*; ``None`` for any other tool name."""
+    if name == 'search_history':
+        if not hist:
+            return "Histórico não disponível."
+        if not guild:
+            return "Busca no histórico requer estar em um servidor."
+        query = args.get('query', '')
+        limit = max(1, min(12, int(args.get('limit', 5))))
+        try:
+            results = await hist.search(query, guild.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
+        except Exception:
+            logger.exception("search_history failed")
+            return "Erro ao buscar no histórico."
+        if not results:
+            return "Nenhuma mensagem relevante encontrada no histórico."
+        return render_search_results(results)
+    if name == 'get_user_stats':
+        if not hist:
+            return "Histórico não disponível."
+        if not guild:
+            return "Requer servidor."
+        try:
+            stats = await hist.get_user_stats(guild.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
+        except Exception:
+            logger.exception("get_user_stats failed")
+            return "Erro ao buscar estatísticas."
+        if "error" in stats:
+            return stats["error"]
+        lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
+        return "\n".join(lines)
+    if name == 'count_mentions':
+        if not hist:
+            return "Histórico não disponível."
+        if not guild:
+            return "Requer servidor."
+        try:
+            groups = await hist.count_mentions(guild.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
+        except Exception:
+            logger.exception("count_mentions failed")
+            return "Erro ao contar menções."
+        if not groups:
+            return "Nenhuma menção encontrada."
+        lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
+        return "\n".join(lines)
+    if name == 'find_user':
+        if not hist:
+            return "Histórico não disponível."
+        if not guild:
+            return "Busca de usuários requer estar em um servidor."
+        query = args.get('query', '')
+        try:
+            limit = max(1, min(12, int(args.get('limit', 5))))
+        except (TypeError, ValueError):
+            limit = 5
+        try:
+            users = await hist.find_users(guild.id, query, limit=limit)  # type: ignore
+        except Exception:
+            logger.exception("find_user failed")
+            return "Erro ao buscar usuários."
+        if not users:
+            return (
+                f"Nenhum usuário encontrado para: {query or '(vazio)'}. "
+                "Tente search_history com author_name se a pessoa já falou no servidor."
+            )
+        lines = []
+        for u in users:
+            label = u.get('full_label') or u.get('display_name') or u.get('author_id', '?')
+            lines.append(
+                f"**{label}** <author_id={u.get('author_id','?')}> — "
+                f"{u.get('msg_count', 0)} msgs, {str(u.get('first_seen',''))[:10]} → {str(u.get('last_seen',''))[:10]}"
+            )
+            aliases = [a for a in u.get('aliases', []) if a and a != u.get('display_name')]
+            if aliases:
+                lines.append(f"  Também conhecido como: {', '.join(aliases[:5])}")
+            if u.get('top_channels'):
+                chans = ', '.join(f"#{c} ({n})" for c, n in u['top_channels'][:3])
+                lines.append(f"  Canais mais ativos: {chans}")
+        return "\n".join(lines)
+    if name == 'sql_history':
+        if not HISTORY_SQL_TOOL_ENABLED:
+            return 'Ferramenta sql_history desativada por configuração (HISTORY_SQL_TOOL_ENABLED).'
+        if not hist:
+            return 'Histórico não disponível.'
+        if not guild:
+            return 'Consulta SQL requer estar em um servidor.'
+        sql = args.get('sql', '')
+        try:
+            text = await hist.exec_sql(guild.id, sql)  # type: ignore
+        except ValueError as e:
+            return f'Consulta rejeitada: {e} Reescreva e tente de novo.'
+        except sqlite3.OperationalError as e:
+            # Mistakes in model-written SQL (unknown column, syntax, timeout)
+            # are expected and fed back to the model: log the query, not a trace.
+            logger.warning('sql_history query failed: %s | sql=%s', e, ' '.join(sql.split())[:1000])
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).'
+        except Exception as e:
+            logger.exception('sql_history failed')
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).'
+        return text
+    return None
+
+
+def history_tool_status(name: str, args: dict) -> str | None:
+    """Status label for the shared history/context tools, ``None`` otherwise."""
+    if name == 'get_channel_history':
+        lim = args.get('limit', 20)
+        cid = args.get('channel_id')
+        return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
+    if name == 'get_guild_info':
+        return '🏰 Coletando informações do servidor'
+    if name == 'search_history':
+        q = args.get('query','')[:40]
+        return f'🔎 Buscando no histórico: *{q}*'
+    if name == 'get_user_stats':
+        return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
+    if name == 'count_mentions':
+        return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
+    if name == 'get_message_context':
+        return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+    if name == 'find_user':
+        return f'👤 Localizando usuário: *{str(args.get("query") or "")[:40] or "mais ativos"}*'
+    if name == 'sql_history':
+        snippet = ' '.join(str(args.get('sql') or '').split())[:60]
+        return f'🗄️ Consultando histórico (SQL): `{snippet}`'
+    return None
+
+
+HISTORY_TOOL_NAMES = ('search_history', 'get_user_stats', 'count_mentions', 'find_user', 'sql_history')
+
+
+def history_tools(hist: 'HistoryRAG') -> list[Tool]:
+    """The history tools, bound to *hist* (``sql_history`` only when enabled)."""
+    schemas = {
+        'search_history': SEARCH_HISTORY_TOOL,
+        'get_user_stats': GET_USER_STATS_TOOL,
+        'count_mentions': COUNT_MENTIONS_TOOL,
+        'find_user': FIND_USER_TOOL,
+        'sql_history': SQL_HISTORY_TOOL,
+    }
+    tools = []
+    for name, schema in schemas.items():
+        if name == 'sql_history' and not HISTORY_SQL_TOOL_ENABLED:
+            continue
+
+        async def run(ctx, args, _name=name):
+            return await exec_history_tool(hist, _name, args, guild=ctx.guild)
+
+        tools.append(Tool(name, schema, run, lambda args, ctx, _name=name: history_tool_status(_name, args)))
+    return tools
+
 
 async def setup(bot: commands.Bot):
     if not HISTORY_ENABLED:

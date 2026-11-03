@@ -15,7 +15,7 @@ from cogs.summary import (
     render_citations,
     split_segments,
 )
-from cogs.utils import BR_TZ
+from config import BR_TZ
 from helpers import as_stream
 
 UTC = datetime.timezone.utc
@@ -283,7 +283,7 @@ def test_exec_tool_permissions_and_output():
     foreign = FakeChannel([], guild=other_guild)
     foreign.id = 444444444444444444
     guild._channels = {channel.id: channel, foreign.id: foreign}
-    cog = summary.ChannelSummary(SimpleNamespace())
+    cog = summary.ChannelSummary(SimpleNamespace(services=SimpleNamespace(llm=SimpleNamespace(available=False, client=None))))
     cog.summarizer = Summarizer(FakeClient(f'**Tópicos**\n- Deploy [msg_id={BASE_ID + 1}]'), 'm')
 
     # No member behind the request (e.g. a scheduled job whose creator left).
@@ -345,11 +345,13 @@ def test_resumo_command_and_publish():
     channel = FakeChannel(msgs, guild=guild)
     stored = []
 
-    class FakeCommandsCog:
-        async def _store_new_conversation(self, msg, question, answer, sources, **kwargs):
+    class FakeChatEngine:
+        async def anchor_conversation(self, msg, question, answer, **kwargs):
             stored.append((msg.id, question, answer))
 
-    bot = SimpleNamespace(get_cog=lambda name: FakeCommandsCog() if name == 'Commands' else None)
+    bot = SimpleNamespace(services=SimpleNamespace(
+        llm=SimpleNamespace(available=False, client=None), chat=FakeChatEngine(),
+    ))
     cog = summary.ChannelSummary(bot)
     cog.summarizer = Summarizer(FakeClient(f'**Tópicos**\n- Build nova [msg_id={BASE_ID + 1}]'), 'm')
     user = SimpleNamespace(id=7, display_name='Eu')

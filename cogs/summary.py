@@ -37,28 +37,22 @@ from typing import Any
 import discord
 from discord import app_commands
 from discord.ext import commands
-from openai import AsyncOpenAI, RateLimitError
+from openai import RateLimitError
 
-from cogs.utils import (
-    BR_TZ,
-    _usage_summary,
-    create_chat_completion,
-    format_message_line,
-    message_content_text,
-    truncate_safe,
-)
 from config import (
+    BR_TZ,
     COOLDOWN_PER,
     COOLDOWN_RATE,
     LLM_MAX_TOKENS,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
     SUMMARY_ENABLED,
     SUMMARY_MAX_DAYS,
     SUMMARY_MAX_MESSAGES,
     SUMMARY_MODEL,
     SUMMARY_SEGMENT_CHARS,
 )
+from core.discord_text import format_message_line, message_content_text, truncate_safe
+from core.llm import create_chat_completion, usage_summary as _usage_summary
+from core.tools import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -440,7 +434,7 @@ ProgressFn = Callable[[str], Awaitable[None]]
 class Summarizer:
     """Fetch → (map →) reduce pipeline over one channel or thread."""
 
-    def __init__(self, client: AsyncOpenAI, model: str = SUMMARY_MODEL, *, segment_chars: int = SUMMARY_SEGMENT_CHARS):
+    def __init__(self, client: Any, model: str = SUMMARY_MODEL, *, segment_chars: int = SUMMARY_SEGMENT_CHARS):
         self.client = client
         self.model = model
         self.segment_chars = segment_chars
@@ -751,12 +745,26 @@ class ChannelSummary(commands.Cog, name='Summary'):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.summarizer: Summarizer | None = None
-        try:
-            client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY or 'not-needed')
-            self.summarizer = Summarizer(client)
-        except Exception:
-            logger.exception('Failed to initialize OpenAI client for ChannelSummary cog')
+        self.services = bot.services
+        llm = self.services.llm
+        self.summarizer: Summarizer | None = Summarizer(llm.client) if llm.available else None
+
+    async def cog_load(self) -> None:
+        self.services.tools.register(Tool(
+            'summarize_channel', SUMMARIZE_CHANNEL_TOOL, self._run_tool,
+            lambda args, ctx: summary_tool_status(args, ctx.guild),
+            structured=True,
+        ))
+
+    async def cog_unload(self) -> None:
+        self.services.tools.unregister('summarize_channel')
+
+    async def _run_tool(self, ctx, args: dict) -> tuple[str, list[dict]]:
+        # The triggering message bounds the range so the request itself is
+        # never summarized; permissions are the requester's.
+        return await self.exec_tool(
+            args, guild=ctx.guild, channel=ctx.channel, requester=ctx.user, before=ctx.message,
+        )
 
     async def _resolve_channel(self, guild: discord.Guild, raw_id: str | None, fallback):
         if not raw_id:
@@ -940,13 +948,13 @@ class ChannelSummary(commands.Cog, name='Summary'):
     async def store_conversation(
         self, msg: discord.Message, question: str, result: SummaryResult, interaction: discord.Interaction,
     ) -> None:
-        """Anchor a /chat conversation on a published summary so replies continue it."""
-        commands_cog = self.bot.get_cog('Commands')
-        if commands_cog is None:
+        """Anchor a conversation on a published summary so replies continue it."""
+        chat = self.services.chat
+        if chat is None:
             return
         try:
-            await commands_cog._store_new_conversation(
-                msg, question, result.text, [],
+            await chat.anchor_conversation(
+                msg, question, result.text,
                 user=interaction.user,
                 guild=interaction.guild,
                 channel=interaction.channel,
