@@ -15,6 +15,13 @@ button. Reads update ``recall_count`` / ``last_recalled_at`` passively.
 Privacy: user-scoped memories are only injected (or returned by search) when
 their subject is part of the current conversation — speaker, mentioned users or
 reply targets. Users can inspect and purge their own memories at any time.
+
+Provenance: every memory records who said it (``told_by``). A fact about a
+person told by someone else is shown to the model as "(segundo Fulano)" — a
+report, not something that person said or confirmed.
+
+Episodes (kind ``episode``) are written by :mod:`core.episodes` when a
+conversation ends: one per participant, capped at ``EPISODES_PER_USER``.
 """
 
 from __future__ import annotations
@@ -36,8 +43,8 @@ import numpy as np
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.utils import PaginatedEmbedView
 from config import (
+    EPISODES_PER_USER,
     LORE_DB_PATH,
     MEMORY_BOT_WRITE_LIMIT,
     MEMORY_DB_PATH,
@@ -49,6 +56,8 @@ from config import (
     MEMORY_PIN_LIMIT,
     MEMORY_SEMANTIC_MIN_SCORE,
 )
+from core.tools import Tool
+from core.ui import PaginatedEmbedView
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +67,15 @@ _KIND_LABELS = {
     'person': 'Pessoa',
     'event': 'Evento',
     'skill': 'Habilidade',
+    'episode': 'Conversa',
 }
 MEMORY_KINDS = tuple(_KIND_LABELS)
+# Episodes are only written by the episode summarizer, never through memory_write.
+WRITABLE_KINDS = tuple(k for k in MEMORY_KINDS if k != 'episode')
 _KIND_CHOICES = [
     app_commands.Choice(name=label, value=key) for key, label in _KIND_LABELS.items()
 ]
-_DEFAULT_IMPORTANCE = {'person': 4, 'preference': 4, 'fact': 3, 'event': 3, 'skill': 3}
+_DEFAULT_IMPORTANCE = {'person': 4, 'preference': 4, 'fact': 3, 'event': 3, 'skill': 3, 'episode': 2}
 _ACTION_VERBS = {
     'create': 'criada',
     'update': 'atualizada',
@@ -74,7 +86,7 @@ _ACTION_VERBS = {
     'unpin': 'desafixada',
     'purge': 'apagada',
 }
-_SNAPSHOT_FIELDS = ('subject', 'kind', 'content', 'importance', 'pinned', 'origin', 'status')
+_SNAPSHOT_FIELDS = ('subject', 'kind', 'content', 'importance', 'pinned', 'origin', 'status', 'told_by')
 _MAX_CONTENT = 500
 _MIN_CONTENT = 10
 _MAX_REASON = 200
@@ -159,7 +171,7 @@ MEMORY_WRITE_TOOL = {
                 },
                 'kind': {
                     'type': 'string',
-                    'enum': list(MEMORY_KINDS),
+                    'enum': list(WRITABLE_KINDS),
                     'description': 'Tipo da memória (padrão: fact).',
                 },
                 'about_user': {
@@ -280,6 +292,7 @@ def _entry_from_row(r: sqlite3.Row) -> dict:
         'updated_by': r['updated_by'],
         'created_at': r['created_at'],
         'updated_at': r['updated_at'],
+        'told_by': (r['told_by'] if 'told_by' in r.keys() else '') or '',
         'embedding': embedding,
     }
 
@@ -368,6 +381,10 @@ class MemoryStore:
                     embedding BLOB
                 )
             """)
+            columns = {row[1] for row in con.execute('PRAGMA table_info(memories)')}
+            if 'told_by' not in columns:
+                # Who said it: the user id whose message led to the memory ('' = unknown/system).
+                con.execute("ALTER TABLE memories ADD COLUMN told_by TEXT NOT NULL DEFAULT ''")
             con.execute('CREATE INDEX IF NOT EXISTS idx_mem_guild ON memories(guild_id, status)')
             con.execute('CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(guild_id, subject)')
             con.execute("""
@@ -467,7 +484,7 @@ class MemoryStore:
         self, guild_id: int, *, subject: str, kind: str, content: str,
         importance: int, pinned: bool, pinned_by: str, origin: str,
         actor: str, actor_name: str, reason: str, embedding=None,
-        status: str = 'active', created_at: str | None = None,
+        status: str = 'active', created_at: str | None = None, told_by: str = '',
     ) -> tuple[dict, int]:
         now = created_at or _now_iso()
         blob = embedding.astype(np.float32).tobytes() if embedding is not None else None
@@ -476,11 +493,11 @@ class MemoryStore:
             cur = con.execute(
                 'INSERT INTO memories '
                 '(guild_id, subject, kind, content, importance, pinned, pinned_by, origin, '
-                'recall_count, last_recalled_at, status, created_by, updated_by, created_at, updated_at, embedding) '
-                'VALUES (?,?,?,?,?,?,?,?,0,NULL,?,?,?,?,?,?)',
+                'recall_count, last_recalled_at, status, created_by, updated_by, created_at, updated_at, embedding, told_by) '
+                'VALUES (?,?,?,?,?,?,?,?,0,NULL,?,?,?,?,?,?,?)',
                 (
                     guild_id, subject, kind, content, importance,
-                    int(pinned), pinned_by, origin, status, actor, actor, now, now, blob,
+                    int(pinned), pinned_by, origin, status, actor, actor, now, now, blob, told_by or '',
                 ),
             )
             memory_id = cur.lastrowid
@@ -515,7 +532,7 @@ class MemoryStore:
         so concurrent writers cannot be silently overwritten by stale state.
         Returns (updated, before, history_id).
         """
-        cols = {'subject', 'kind', 'content', 'importance', 'pinned', 'pinned_by', 'origin', 'status'}
+        cols = {'subject', 'kind', 'content', 'importance', 'pinned', 'pinned_by', 'origin', 'status', 'told_by'}
         con = self._connect()
         try:
             con.execute('BEGIN IMMEDIATE')
@@ -786,6 +803,7 @@ class Memory(commands.Cog, name='Memory'):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.services = getattr(bot, 'services', None)
         self.store = MemoryStore(MEMORY_DB_PATH)
         self._bot_writes: dict[int, deque[float]] = {}
         self._log_tasks: set[asyncio.Task] = set()
@@ -796,6 +814,15 @@ class Memory(commands.Cog, name='Memory'):
             await asyncio.to_thread(self._migrate_lore)
         except Exception:
             logger.exception("Memory DB init failed — memory tools will degrade to error messages")
+        if self.services is not None:
+            self.services.memory = self
+            self.services.tools.register(*memory_tools(self))
+
+    async def cog_unload(self):
+        if self.services is not None:
+            self.services.tools.unregister(*MEMORY_TOOL_NAMES)
+            if self.services.memory is self:
+                self.services.memory = None
 
     # --- One-time lore migration ---
 
@@ -877,17 +904,34 @@ class Memory(commands.Cog, name='Memory'):
         finally:
             con.close()
 
-    # --- Embeddings (reuse DocsRAG / HistoryRAG clients) ---
+    # --- Embeddings (the bot's shared LLM service) ---
 
     async def _embed_texts(self, texts: list[str]) -> list[list[float]] | None:
-        for cog_name in ('DocsRAG', 'HistoryRAG'):
-            cog = self.bot.get_cog(cog_name)
-            if cog is not None and hasattr(cog, '_embed_batch'):
-                try:
-                    return await cog._embed_batch(texts)
-                except Exception:
-                    logger.exception('[memory] embedding via %s failed', cog_name)
-        return None
+        llm = getattr(self.services, 'llm', None)
+        if llm is None:
+            return None
+        try:
+            return await llm.embed(texts)
+        except Exception:
+            logger.exception('[memory] embedding failed')
+            return None
+
+    async def get(self, guild_id: int, memory_id: int) -> dict | None:
+        """One memory by id (any status), or ``None``."""
+        return await asyncio.to_thread(self.store.get_memory, guild_id, memory_id)
+
+    # --- Provenance ---
+
+    def told_by_note(self, guild_id: int, entry: dict) -> str:
+        """' (segundo Fulano)' when a memory about someone was told by someone else."""
+        told_by = entry.get('told_by') or ''
+        subject = entry.get('subject') or ''
+        if not told_by or not subject or told_by == subject or not told_by.isdigit():
+            return ''
+        g = self.bot.get_guild(guild_id) if self.bot is not None else None
+        member = g.get_member(int(told_by)) if g else None
+        name = member.display_name if member else f'usuário {told_by}'
+        return f' (segundo {name})'
 
     async def _embed_content(self, content: str):
         result = await self._embed_texts([content])
@@ -1039,7 +1083,7 @@ class Memory(commands.Cog, name='Memory'):
 
             def line(e: dict) -> str:
                 pin = ' 📌' if e['pinned'] else ''
-                return f"- [mem #{e['id']}{pin}] {e['content']}"
+                return f"- [mem #{e['id']}{pin}] {e['content']}{self.told_by_note(guild_id, e)}"
 
             blocks: list[str] = []
             if guild_lines:
@@ -1102,6 +1146,7 @@ class Memory(commands.Cog, name='Memory'):
                 return await self._exec_write(
                     args, guild=guild, actor_id=actor_id, actor_name=actor_name,
                     origin=origin, participants=participants,
+                    told_by=str(getattr(requester, 'id', '') or ''),
                 )
         except MemoryError as e:
             return f'⚠️ Memória: {e}', []
@@ -1175,7 +1220,7 @@ class Memory(commands.Cog, name='Memory'):
             parts.append(
                 f"[mem #{entry['id']}] ({scope}, {_KIND_LABELS.get(entry['kind'], entry['kind'])}, "
                 f"importância {entry['importance']}, score {score:.2f})\n"
-                f'{entry["content"]}{origin}'
+                f'{entry["content"]}{self.told_by_note(guild.id, entry)}{origin}'
             )
         return '\n\n---\n\n'.join(parts), []
 
@@ -1231,11 +1276,50 @@ class Memory(commands.Cog, name='Memory'):
         parts = [f'Memórias ativas sobre {self._subject_name(guild.id, subject)} ({len(entries)}):']
         for k, mems in by_kind.items():
             lines = [
-                f"- [mem #{e['id']}]{' 📌' if e['pinned'] else ''} {e['content']}"
+                f"- [mem #{e['id']}]{' 📌' if e['pinned'] else ''} {e['content']}{self.told_by_note(guild.id, e)}"
                 for e in mems[:6]
             ]
             parts.append(f'{_KIND_LABELS.get(k, k)}:\n' + '\n'.join(lines))
         return '\n\n'.join(parts), []
+
+    # --- Episodes (summaries of ended conversations, see core.episodes) ---
+
+    async def record_episode(self, guild_id: int, subjects: list[str], content: str, *, origin: str = '') -> list[dict]:
+        """Store one episode memory per participant, keeping the newest EPISODES_PER_USER each."""
+        content = _snippet(content, _MAX_CONTENT)
+        embedding = await self._embed_content(content)
+        created: list[dict] = []
+        for i, subject in enumerate(dict.fromkeys(s for s in subjects if s)):
+            entry, history_id = await asyncio.to_thread(
+                self.store.create_with_history, guild_id,
+                subject=subject, kind='episode', content=content,
+                importance=_DEFAULT_IMPORTANCE['episode'], pinned=False, pinned_by='',
+                origin=origin if origin.startswith('http') else '',
+                actor='bot', actor_name='bot (resumo de conversa)',
+                reason='Resumo de uma conversa encerrada', embedding=embedding,
+            )
+            created.append(entry)
+            if i == 0:
+                self._schedule_log(
+                    guild_id, action='create', entry=entry, before=None,
+                    actor_name='bot (resumo de conversa)', reason='Resumo de uma conversa encerrada',
+                    history_id=history_id,
+                )
+            await self._trim_episodes(guild_id, subject)
+        return created
+
+    async def _trim_episodes(self, guild_id: int, subject: str) -> None:
+        episodes = [
+            e for e in await asyncio.to_thread(self.store.list_memories, guild_id, subject=subject)
+            if e['kind'] == 'episode' and e['status'] == 'active'
+        ]
+        episodes.sort(key=lambda e: e['id'], reverse=True)
+        for old in episodes[max(0, EPISODES_PER_USER):]:
+            await asyncio.to_thread(
+                self.store.update_with_history, guild_id, old['id'], {'status': 'archived'},
+                action='forget', actor='bot', actor_name='bot (resumo de conversa)',
+                reason=f'Mais de {EPISODES_PER_USER} conversas guardadas',
+            )
 
     # --- Bot write rate limiting (peek first, debit only on actual writes) ---
 
@@ -1320,7 +1404,7 @@ class Memory(commands.Cog, name='Memory'):
 
     async def _exec_write(
         self, args: dict, *, guild: discord.Guild, actor_id: str, actor_name: str,
-        origin: str | None, participants: set[str],
+        origin: str | None, participants: set[str], told_by: str = '',
     ) -> tuple[str, list[dict]]:
         if actor_id == 'bot' and not self._bot_write_slots(guild.id):
             return 'Limite de escritas do bot por hora atingido. Tente novamente mais tarde.', []
@@ -1352,7 +1436,7 @@ class Memory(commands.Cog, name='Memory'):
             if len(content) < _MIN_CONTENT:
                 return f'`content` muito curto — escreva uma frase completa (mínimo {_MIN_CONTENT} caracteres).', []
             content = content[:_MAX_CONTENT]
-            kind = args.get('kind') if args.get('kind') in MEMORY_KINDS else 'fact'
+            kind = args.get('kind') if args.get('kind') in WRITABLE_KINDS else 'fact'
             err = self._attribution_error(guild, subject, kind, content)
             if err:
                 return err, []
@@ -1389,9 +1473,15 @@ class Memory(commands.Cog, name='Memory'):
                 guild.id, subject=subject, kind=kind, content=content,
                 importance=importance, pinned=pinned, pinned_by=actor_id,
                 origin=origin_url, actor_id=actor_id, actor_name=actor_name,
-                reason=reason, embedding=embedding,
+                reason=reason, embedding=embedding, told_by=told_by,
             )
             note = ' — fixada: entra em toda conversa.' if pinned else ''
+            hearsay = self.told_by_note(guild.id, entry)
+            if hearsay:
+                note += (
+                    f' — registrada como relato{hearsay}, não confirmada pela própria pessoa; '
+                    'se ela confirmar, atualize a memória'
+                )
             return (
                 f"Memória criada: [mem #{entry['id']}] \"{content}\" "
                 f'(tipo={kind}, importância={importance}{note})'
@@ -1423,7 +1513,10 @@ class Memory(commands.Cog, name='Memory'):
             if len(content) < _MIN_CONTENT:
                 return f'`content` muito curto (mínimo {_MIN_CONTENT} caracteres).', []
             patch['content'] = content[:_MAX_CONTENT]
-        if args.get('kind') in MEMORY_KINDS:
+            if told_by:
+                # Whoever restates the fact now is who said it.
+                patch['told_by'] = told_by
+        if args.get('kind') in WRITABLE_KINDS:
             patch['kind'] = args['kind']
         if args.get('importance') is not None:
             patch['importance'] = _parse_importance(args.get('importance'), entry['importance'])
@@ -1494,14 +1587,14 @@ class Memory(commands.Cog, name='Memory'):
     async def _create(
         self, guild_id: int, *, subject: str, kind: str, content: str,
         importance: int, pinned: bool, pinned_by: str, origin: str,
-        actor_id: str, actor_name: str, reason: str, embedding=None,
+        actor_id: str, actor_name: str, reason: str, embedding=None, told_by: str = '',
     ) -> dict:
         entry, history_id = await asyncio.to_thread(
             self.store.create_with_history, guild_id,
             subject=subject, kind=kind, content=content, importance=importance,
             pinned=pinned, pinned_by=pinned_by, origin=origin,
             actor=actor_id, actor_name=actor_name, reason=reason,
-            embedding=embedding,
+            embedding=embedding, told_by=told_by,
         )
         logger.info(
             "[memory] create #%d '%s' (kind=%s, imp=%d, pinned=%s) by %s",
@@ -1745,6 +1838,9 @@ class Memory(commands.Cog, name='Memory'):
         embed.add_field(name='Atualizada', value=_fmt_brt(entry['updated_at']), inline=True)
         if entry['origin']:
             embed.add_field(name='Origem', value=entry['origin'], inline=False)
+        hearsay = self.told_by_note(guild.id, entry)
+        if hearsay:
+            embed.add_field(name='Contada por', value=hearsay.strip(' ()').removeprefix('segundo '), inline=True)
         if _is_admin(interaction):
             history = await asyncio.to_thread(self.store.history_for_memory, guild.id, entry['id'], 5)
             if history:
@@ -1881,6 +1977,7 @@ class Memory(commands.Cog, name='Memory'):
         await asyncio.to_thread(self.store.mark_recalled, interaction.guild.id, [e['id'] for e in entries])
         lines = [
             f"- [#{e['id']}]{' 📌' if e['pinned'] else ''} {_snippet(e['content'], 120)}"
+            f"{self.told_by_note(interaction.guild.id, e)}"
             for e in entries[:20]
         ]
         embed = discord.Embed(
@@ -1966,6 +2063,40 @@ class Memory(commands.Cog, name='Memory'):
             file=file,
             ephemeral=True,
         )
+
+
+MEMORY_TOOL_NAMES = ('memory_search', 'memory_write', 'memory_about')
+
+
+def memory_tools(cog: Memory) -> list[Tool]:
+    """The memory tools bound to *cog* (each turn's speaker, channel and participants)."""
+
+    async def run(ctx, args, *, name):
+        if ctx.guild is None:
+            return 'Memória requer estar em um servidor.'
+        return await cog.exec_tool(
+            name, args, guild=ctx.guild, actor_name=ctx.actor_name,
+            requester=ctx.user, channel=ctx.channel, origin=ctx.origin,
+            participant_ids=ctx.participant_ids,
+        )
+
+    def status(args, ctx, *, name):
+        if name == 'memory_search':
+            return f"🧠 Recordando: *{str(args.get('query', ''))[:40]}*"
+        if name == 'memory_write':
+            target = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
+            return f"🧠 Memória — {args.get('action', 'write')}: *{target}*"
+        return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
+
+    schemas = {'memory_search': MEMORY_SEARCH_TOOL, 'memory_write': MEMORY_WRITE_TOOL, 'memory_about': MEMORY_ABOUT_TOOL}
+    return [
+        Tool(
+            name, schema,
+            lambda ctx, args, _n=name: run(ctx, args, name=_n),
+            lambda args, ctx, _n=name: status(args, ctx, name=_n),
+        )
+        for name, schema in schemas.items()
+    ]
 
 
 async def setup(bot: commands.Bot):

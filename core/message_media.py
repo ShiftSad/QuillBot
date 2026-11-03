@@ -7,7 +7,7 @@ unless they are rendered. This module turns them into
 
 - text markers for the canonical message line (``[figurinha:Nome]``,
   ``[gif: cat dance]``, ``:kek:`` instead of ``<:kek:123>``);
-- image sources :func:`cogs.image_store.persist_images` can store, each with
+- image sources :func:`core.image_store.persist_images` can store, each with
   an ``id`` (download cache key) and ``async read()``;
 - a reactions suffix listing each reaction with its count and who reacted;
 - the ``add_reaction`` tool, so the model can react in the current channel.
@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 import discord
 from cachetools import LRUCache
 
-from cogs import image_store
+from core import image_store
 from config import CHANNEL_CONTEXT_REACTIONS_ENABLED, REACTION_USERS_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -332,7 +332,8 @@ ADD_REACTION_TOOL = {
             'Adiciona uma reação (emoji) a uma mensagem do canal atual. Sem message_id, reage à '
             'mensagem que acionou você. Aceita emoji Unicode (ex: 👍) ou emoji personalizado do '
             'servidor como :nome:. Use quando pedirem ou quando uma reação combinar com o momento, '
-            f'no máximo {REACTION_TOOL_MAX_PER_ANSWER} por resposta; ela não substitui a resposta em texto.'
+            f'no máximo {REACTION_TOOL_MAX_PER_ANSWER} por resposta. Quando a mensagem não pede resposta '
+            'em texto (um "valeu", uma risada), a reação pode ser a resposta inteira: reaja e responda [NO_REPLY].'
         ),
         'parameters': {
             'type': 'object',

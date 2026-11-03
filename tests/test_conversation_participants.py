@@ -3,7 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from cogs.conversation_store import (
+from core.conversations import (
     conversation_participant_ids,
     message_participant_infos,
 )

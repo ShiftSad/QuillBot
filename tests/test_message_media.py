@@ -7,9 +7,10 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from cogs import image_store
-from cogs import message_media as mm
-from cogs import utils
+from core import image_store
+from core import message_media as mm
+from core import context as utils
+from core.discord_text import message_content_text
 
 
 def _now():
@@ -92,11 +93,11 @@ def test_content_text_markers():
         stickers=[sticker('Pepe Feliz')],
         embeds=[tenor_embed()],
     )
-    text = utils.message_content_text(msg)
+    text = message_content_text(msg)
     assert text == 'olha :kek: e :party: [figurinha:Pepe Feliz] [gif: cat dance]'
 
     only_sticker = fake_message(2, stickers=[sticker('Oi')])
-    assert utils.message_content_text(only_sticker) == '[figurinha:Oi]'
+    assert message_content_text(only_sticker) == '[figurinha:Oi]'
 
 
 def test_media_sources_order_and_lottie():
@@ -119,7 +120,7 @@ def test_media_sources_order_and_lottie():
     )
     assert isinstance(sources[3], mm.EmojiSheet)
     assert len(sources) == 4
-    assert '[figurinha:vector]' in utils.message_content_text(msg)  # lottie: name only
+    assert '[figurinha:vector]' in message_content_text(msg)  # lottie: name only
 
 
 def test_giphy_urls_and_label():

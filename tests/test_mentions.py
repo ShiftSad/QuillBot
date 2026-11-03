@@ -3,7 +3,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from cogs.utils import extract_pingable_mentions, strip_bot_mention
+from core.discord_text import extract_pingable_mentions, strip_bot_mention
 
 
 class FakeGuild:

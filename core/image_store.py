@@ -26,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from config import (
     IMAGE_JPEG_QUALITY,
     IMAGE_MAX_SIDE,
+    IMAGE_MAX_SIDE_SHOWN,
     IMAGE_RETENTION_SECONDS,
     IMAGES_DIR,
     MAX_CONTENT_SIZE,
@@ -167,8 +168,8 @@ def labeled_grid(items: list[tuple[bytes, str]], cell: int = 96, columns: int = 
     return out.getvalue()
 
 
-def _encode(data: bytes) -> bytes:
-    """Re-encode raw image bytes as a downscaled JPEG (~150-250 KB per image).
+def _encode(data: bytes, max_side: int = IMAGE_MAX_SIDE) -> bytes:
+    """Re-encode raw image bytes as a downscaled JPEG (longest side *max_side*).
 
     Animated images become a sheet of sampled frames; transparency is
     composited on white.
@@ -179,18 +180,18 @@ def _encode(data: bytes) -> bytes:
         img = sheet
     else:
         img = _flatten_alpha(ImageOps.exif_transpose(img))
-    img.thumbnail((IMAGE_MAX_SIDE, IMAGE_MAX_SIDE), Image.LANCZOS)
+    img.thumbnail((max_side, max_side), Image.LANCZOS)
     out = io.BytesIO()
     img.save(out, format='JPEG', quality=IMAGE_JPEG_QUALITY, optimize=True)
     return out.getvalue()
 
 
-async def persist(data: bytes) -> str | None:
+async def persist(data: bytes, *, max_side: int = IMAGE_MAX_SIDE) -> str | None:
     """Re-encode and store raw image bytes; returns a ref or None on failure."""
     if not data or len(data) > MAX_CONTENT_SIZE:
         return None
     try:
-        encoded = await asyncio.to_thread(_encode, data)
+        encoded = await asyncio.to_thread(_encode, data, max_side)
     except Exception:
         logger.exception('Failed to re-encode image (%d bytes)', len(data))
         return None
@@ -228,18 +229,20 @@ def _touch(ref: str) -> bool:
         return False
 
 
-async def persist_attachment(attachment: Any) -> str | None:
+async def persist_attachment(attachment: Any, *, max_side: int = IMAGE_MAX_SIDE) -> str | None:
     """Download a discord.Attachment once and store it re-encoded.
 
     Attachments are immutable, so a known attachment id reuses its stored ref
     instead of re-downloading — channel context re-reads the same recent
     messages on every mention. Any object with ``id`` and ``async read()``
     works the same way (stickers, link embeds and emoji sheets from
-    :mod:`cogs.message_media`).
+    :mod:`core.message_media`). Each size is stored apart (see
+    ``IMAGE_MAX_SIDE_SHOWN``).
     """
     att_id = getattr(attachment, 'id', None)
+    key = (att_id, max_side)
     if att_id is not None:
-        ref = _attachment_refs.get(att_id)
+        ref = _attachment_refs.get(key)
         if ref and _touch(ref):
             return ref
     try:
@@ -247,9 +250,9 @@ async def persist_attachment(attachment: Any) -> str | None:
     except Exception:
         logger.exception('Failed to read attachment %s', getattr(attachment, 'url', '?'))
         return None
-    ref = await persist(data)
+    ref = await persist(data, max_side=max_side)
     if ref and att_id is not None:
-        _attachment_refs[att_id] = ref
+        _attachment_refs[key] = ref
     return ref
 
 
@@ -271,20 +274,25 @@ async def download(url: str) -> bytes | None:
         return None
 
 
-async def persist_url(url: str) -> str | None:
+async def persist_url(url: str, *, max_side: int = IMAGE_MAX_SIDE) -> str | None:
     """Download an image URL once and store it re-encoded."""
     data = await download(url)
-    return await persist(data) if data else None
+    return await persist(data, max_side=max_side) if data else None
 
 
-async def persist_images(attachments: Iterable[Any]) -> list[str]:
+async def persist_shown(attachments: Iterable[Any]) -> list[str]:
+    """Persist images someone is showing the bot, at the sharper ``IMAGE_MAX_SIDE_SHOWN``."""
+    return await persist_images(attachments, max_side=IMAGE_MAX_SIDE_SHOWN)
+
+
+async def persist_images(attachments: Iterable[Any], *, max_side: int = IMAGE_MAX_SIDE) -> list[str]:
     """Persist an iterable of attachments/urls, capped per turn, dropping failures."""
     refs: list[str] = []
     for att in list(attachments)[:MAX_IMAGES_PER_TURN]:
         if hasattr(att, 'read'):
-            ref = await persist_attachment(att)
+            ref = await persist_attachment(att, max_side=max_side)
         else:
-            ref = await persist_url(att) if isinstance(att, str) and att else None
+            ref = await persist_url(att, max_side=max_side) if isinstance(att, str) and att else None
         if ref:
             refs.append(ref)
     return refs
@@ -313,6 +321,20 @@ def context_image_marker(count: int = 1) -> str:
     if count == 1:
         return '[uma imagem do canal deste turno não foi reenviada]'
     return f'[{count} imagens do canal deste turno não foram reenviadas]'
+
+
+def shown_image_note(count: int) -> str:
+    """Label for the images the person attached (or the message they replied to carries).
+
+    Without it a mention like "ai oh @bot" with a screenshot reads the same as
+    the channel images that follow, and the model may describe the wrong one.
+    """
+    if count == 1:
+        return '[a primeira imagem abaixo veio com esta mensagem (ou com a mensagem que ela responde): é o que a pessoa está mostrando]'
+    return (
+        f'[as {count} primeiras imagens abaixo vieram com esta mensagem (ou com a mensagem que ela '
+        'responde): são o que a pessoa está mostrando]'
+    )
 
 
 def context_image_note(count: int, *, after_user_images: bool = False) -> str:

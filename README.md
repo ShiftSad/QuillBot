@@ -1,6 +1,9 @@
-# QuillBot — Discord Bot for Minecraft Server Administration
+# QuillBot — Conversational Discord Bot for the Miners' Refuge Community
 
-AI-powered Discord bot for the **Miners' Refuge** community. Helps Minecraft server admins troubleshoot logs, diagnose performance with Spark, search documentation, and find plugins — all from Discord.
+AI-powered Discord bot that takes part in the **Miners' Refuge** community's conversations: it answers when mentioned, replied to or called by name, remembers people and past conversations, knows when to stay quiet, and brings Minecraft server administration tools into the chat — documentation search, log analysis, Spark diagnosis and plugin search.
+
+Its personality is the server's: a `<personalidade>` block per server — a base the admins write and notes the bot keeps about itself — that rides in every system prompt (see [`/persona`](#persona--personality)).
+
 
 Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augmented Generation) over multiple documentation sources.
 
@@ -9,8 +12,10 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 ## Table of Contents
 
 - [Features](#features)
+- [Conversations](#conversations)
 - [Slash Commands](#slash-commands)
 - [Passive Features](#passive-features)
+- [Architecture](#architecture)
 - [AI & RAG System](#ai--rag-system)
 - [Documentation Sources](#documentation-sources)
 - [Project Structure](#project-structure)
@@ -26,8 +31,14 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 
 | Category | Capability |
 |---|---|
-| **Q&A (RAG)** | Answers questions grounded in indexed docs (Miners' Refuge, PaperMC, PurpurMC, Spark) |
-| **General Chat** | Open-ended assistant with web search, server/history context awareness |
+| **Conversation** | Answers @mentions, replies to its messages, messages in its threads and being called by name; plain messages like any member (embeds only for summaries, reports and long answers); quick consecutive messages answered as one; may just react or stay quiet |
+| **Q&A (RAG)** | Answers questions grounded in indexed docs (Miners' Refuge, PaperMC, PurpurMC, Spark) — in any conversation, not only `/ask` |
+| **General Chat** | Web search, server/history context awareness, one voice across every entry point |
+| **Episodes** | When a conversation ends, the bot keeps a short summary of it per participant, so it can pick the subject up later ("e aí, deu certo o backup?") |
+| **Server Wrapped** | `/wrapped` or asking the bot: who talked most, busiest channels and hours, who replied to whom, favorite emojis, most-reacted messages; optional weekly/monthly automatic recap |
+| **Personality** | Per server, in the system prompt: a *base* (who the bot is) that admins edit with `/persona` or ask the bot to change, and *notes* (running jokes, nicknames, catchphrases) the bot rewrites itself, a few times a day at most. Every change is versioned, logged with a Revert button and revertible |
+| **Settings** | `/config`: per channel (when to answer, name calls, threads, reply format, log detection, channel instructions) and per server (extra names, automatic Wrapped) |
+| **Edits & deletes** | Deleting a message the bot answered deletes the answer; editing it within a minute re-answers it |
 | **Chat Threads** | Long or off-topic conversations move into a thread on the asker's message, so the channel keeps one message; inside it the bot answers without a mention and stays quiet when people talk among themselves |
 | **Log Analysis** | AI analysis of mclo.gs/pastebin links, file uploads, and screenshots |
 | **Error Detection** | Instant passive replies for 20+ known Minecraft error patterns |
@@ -36,9 +47,33 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Server Tools** | JVM flags, server status checks, docs changelog |
 | **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Monitors** | Standing triggers (channels, authors, mentions of a user, a content regex) that call the bot on matching messages; it answers like a mention, knows a monitor sent it, and may stay silent. Managed with `/monitor` or by asking the bot |
-| **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control |
+| **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control. Each memory records who said it — a fact about someone told by someone else is shown as a report ("segundo Fulano") |
 
-All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
+All AI responses are in **Brazilian Portuguese**.
+
+---
+
+## Conversations
+
+Everything below goes through one chat engine (`core/chat_engine.py`), so `/chat`, `/ask`, mentions, replies, threads, name calls, monitors and scheduled tasks share the same behavior.
+
+**When the bot answers** — a reply to one of its messages, an @mention, any message in a thread it opened, or its name in a message ("quill, o que acha?"). Names: its server nickname, its username, those without a trailing "bot", `CHAT_NAME_ALIASES` and the server's `aliases` setting; not inside links, code or other mentions. Name calls and thread messages reach the model marked as not addressed to it, and it may stay silent.
+
+**Bursts instead of a cooldown** — people type in bursts ("ei" / "sabe aquele erro" / "de ontem?"). A message for the bot opens a burst for that person in that channel; everything they send there until they've been quiet `CHAT_BURST_SECONDS` joins it (mention or not) and is answered as one turn, replying to the last message. Messages sent while the bot is answering become the next turn of the same conversation. Nothing is dropped. A burst that so far only points at something ("ai oh @Quill", "olha isso": short, no image, link or reply) waits `CHAT_BURST_SHORT_SECONDS` instead, so the screenshot uploaded right after it is part of the turn.
+
+**Budget** — cost is controlled per person (`CHAT_USER_BUDGET` turns per `CHAT_USER_BUDGET_WINDOW`) and per server (`CHAT_GUILD_BUDGET`, monitors included). Over budget, the bot reacts ⏳ instead of answering (a slash command gets an ephemeral notice).
+
+**Doing what was asked** — the personality changes how the bot talks, never what it does: asked to search, it searches (a message that asks for a search — "pesquise", "procura", "busca" — also gets a hint to call `web_search`/`search_docs` first); when someone only points at something ("esse sinal", "isso"), it reads more history with `get_channel_history` instead of guessing; and if they point at an image or link that didn't come with the message, it says so instead of describing a channel image.
+
+**Staying quiet** — on any turn the model may react (`add_reaction`) and answer `[NO_REPLY]`: a "valeu!" gets a ❤️, not a paragraph. Someone who asked directly still hears about a failed answer; unaddressed turns never do.
+
+**How answers look** — plain messages, like any member; `@Name` written by the model becomes a real mention and only those people are pinged (never roles, `@everyone` or bots). Sources go in a small `-# Fontes:` line. Spark reports, channel summaries, Wrapped and answers longer than `CHAT_PLAIN_MAX_CHARS` go in embeds. A channel can force either with `/config canal reply_style`.
+
+**Continuing** — replying to any bot message of a conversation continues it; a mention continues the bot's latest conversation in the last `CHAT_MENTION_CONTINUE_WINDOW` messages. Conversations expire after `CONVERSATIONS_TTL_SECONDS` without activity; then an *episode* — one or two sentences on what was talked about and what was left pending — is saved as a memory for each participant (`EPISODES_*`).
+
+**Edits and deletes** — deleting a message the bot answered deletes the answer and drops that turn (part of a burst keeps the answer); editing it within `CHAT_EDIT_WINDOW_SECONDS` of the answer re-answers it, editing the old answer in place.
+
+**Threads** — see [`/chat`](#chat-question-image) below; per channel, `/config canal threads` is `auto`, `always` or `never`.
 
 ---
 
@@ -46,31 +81,30 @@ All AI responses are in **Brazilian Portuguese** and formatted for Discord embed
 
 ### AI-Powered Commands
 
-#### `/ask <question> [image]`
-Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `memory_search`, `search_history`, and context tools to ground its answer in real documentation.
-
-- **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
-- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `find_user`, `sql_history`, `add_reaction`
-- **Features:** Image/screenshot analysis, 5-minute ephemeral prompt+report cache, paginated multi-embed output with source links, reply to continue conversation (30 min TTL, 200 conversations), cooldown per user
-- **Follow-up:** Reply to the bot's response to continue the conversation with full history
-
 #### `/chat <question> [image]`
-General-purpose assistant (same agentic loop as `/ask` but with web search).
+Talk to the bot from a slash command: the same conversation as a mention (profile `chat`, `core/profiles.py`).
 
-- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools, the monitor tools (see `/monitor`), `summarize_channel` (see `/resumo`) and `open_thread` (see threads below)
-- **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. `REACTION_TOOL_ENABLED=false` removes the tool
+- **Tools:** `web_search`, `web_extract` (via Tavily), `search_docs`, `search_plugins`, the context/history tools, memory, the scheduler and monitor tools (see `/monitor`), `summarize_channel` (see `/resumo`), `server_wrapped` (see `/wrapped`), `add_reaction` and `open_thread` (see threads below)
+- **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. A reaction can be the whole answer (`[NO_REPLY]`). `REACTION_TOOL_ENABLED=false` removes the tool
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
-- **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
-- A mention continues the conversation when one of the bot's `/chat`/mention answers is among the last `CHANNEL_CONTEXT_MESSAGES` channel messages, just like replying to it; a mention that replies to someone else's message joins it too, with that message as context (`CHAT_MENTION_CONTINUE_ENABLED=false` always starts a new one)
-- Set `CHAT_MENTION_ENABLED=false` to disable mention mode
-- **Threads (`cogs/chat_threads.py`):** a quick question is answered in the channel, but a conversation moves into a thread when
+- **Mentions, replies, name calls:** see [Conversations](#conversations). A mention continues the conversation when one of the bot's answers is among the last `CHAT_MENTION_CONTINUE_WINDOW` channel messages, just like replying to it; a mention that replies to someone else's message joins it too, with that message as context (`CHAT_MENTION_CONTINUE_ENABLED=false` always starts a new one). `CHAT_MENTION_ENABLED=false` leaves only replies to the bot
+- **Threads (`core/chat_threads.py`):** a quick question is answered in the channel, but a conversation moves into a thread when
   - it reaches `CHAT_THREAD_AFTER_TURNS` turns (default 3, the second follow-up),
-  - it happens in one of `CHAT_THREAD_CHANNELS` (first answer already in a thread), or
+  - the channel's `threads` setting is `always` (or the channel is in `CHAT_THREAD_CHANNELS`): first answer already in a thread, or
   - the model calls `open_thread` because the question has nothing to do with what the channel is discussing, or is casual chat (`CHAT_THREAD_TOOL_ENABLED=false` removes the tool)
+- `threads: never` keeps every answer in the channel (and `open_thread` tells the model so)
 - The thread is opened on the asker's message (for `/chat`, on the command's response) and named after the conversation's first question, or the title the model picked. The channel keeps only that message; the answer goes into the thread and pings the asker, which also adds them to it. Threads archive after `CHAT_THREAD_ARCHIVE_MINUTES` idle
 - A conversation that moved keeps answering in its thread, also when someone continues it from the channel (an archived thread is reopened)
-- Inside a thread the bot opened, every message is for the bot — no mention needed, and an expired conversation just starts a new one there. The model is told the message didn't mention it and may answer `[NO_REPLY]` to stay silent when people are talking among themselves; cooldowns skip those messages quietly instead of posting "⏳ Aguarde"
-- No thread is opened where Discord has none (threads, forum posts, voice-channel chats, DMs) or without the Create Public Threads and Send Messages in Threads permissions; the answer stays in place. `CHAT_THREADS_ENABLED=false` turns all of this off
+- Inside a thread the bot opened, every message is for the bot — no mention needed, and an expired conversation just starts a new one there. The model is told the message didn't mention it and may answer `[NO_REPLY]` to stay silent when people are talking among themselves
+- No thread is opened where Discord has none (threads, forum posts, voice-channel chats, DMs) or without the Create Public Threads and Send Messages in Threads permissions; the answer stays in place. A missing permission is logged once per channel (`[threads] cannot open threads in #… the bot lacks …`), and `open_thread` tells the model which one, so it can say so instead of guessing. `CHAT_THREADS_ENABLED=false` turns all of this off
+
+#### `/ask <question> [image]`
+Ask a Minecraft server administration question with the docs-first profile (`ask`): the model calls `search_docs` right away and grounds every answer in the indexed documentation. Same bot and voice as `/chat` — mentions and `/chat` can search the docs too; `/ask` just insists on it.
+
+- **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
+- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `get_user_stats`, `count_mentions`, `find_user`, `sql_history`, `add_reaction`
+- **Output:** plain message with a `-# Fontes:` line; long answers in an embed titled with the question, with source pages
+- **Follow-up:** Reply to the bot's response to continue the conversation with full history (it stays on the `ask` profile)
 
 #### `/resumo [canal] [periodo] [foco]`
 Summarize what happened in a channel or thread while you were away.
@@ -93,7 +127,8 @@ A monitor calls the bot on every message that matches **all** of its filters, as
 
 - **Filters** (at least one, combined with AND): `channels` (threads under them count), `authors` (the message was sent by…), `mentions` (the message mentions…), `regex` (case-insensitive search over the content; nested quantifiers like `(a+)+` are refused)
 - **Instruction:** what the bot should do on a match, including when to stay silent
-- **Never fires on:** bot messages, and messages the bot already answers (an @mention of it, a reply to one of its conversations, anything in a chat thread the bot opened). Several monitors matching one message share one run
+- **Never fires on:** bot messages, and messages the bot already answers — the message router offers every message to the chat engine first (mentions, replies to its conversations, its threads, name calls, bursts), and monitors only see what it didn't take. Several monitors matching one message share one run
+- **Budget:** a monitor run spends the server budget (`CHAT_GUILD_BUDGET`)
 - **Cooldown:** per monitor, `MONITORS_DEFAULT_COOLDOWN` seconds by default (min `MONITORS_MIN_COOLDOWN`), so a busy channel doesn't cost one LLM call per message
 - **Commands:** `create`, `list`, `show`, `edit` (a slash option replaces that filter with one value; `clear` removes a filter), `pause`, `resume`, `delete`
 - **LLM tools:** `monitor_create`, `monitor_list`, `monitor_update` (lists, clearing, pause/resume) and `monitor_delete` — "sempre que alguém mencionar a staff em #suporte, veja se precisa de ajuda" works from `/chat` or a mention
@@ -119,7 +154,8 @@ Analyze a [Spark Profiler](https://spark.lucko.me) report with deep AI diagnosis
 - **LLM flow:** Injects a compact summary (~1.7k chars) as synthetic prior exchange, follows an 8-step diagnostic protocol (TPS → MSPT → lag spike detection → waitForNextTick → GC → hotspots → config → grounded recommendation), uses `SPARK_MODEL` (default: `google/gemini-2.5-pro`)
 - **Spark tools:** `get_spark_detail` (sections: `hotspots`, `jvm`, `profiler`, `plugins`, `world`, `game_rules`, `configs:<file>`) and `get_config_key` (single-key lookup)
 - **Platform awareness:** Detects Paper/Purpur/Spigot/Forge/Fabric/Vanilla and never recommends configs that don't exist for that platform
-- **Passive detection:** Any `spark.lucko.me` link in chat triggers a "🔥 Analisar com IA" button
+- **Passive detection:** Any `spark.lucko.me` link in chat triggers a "🔥 Analisar com IA" button (off where the channel's `log_detection` setting is off)
+- **Output:** an embed (reports always are); replying continues the analysis with the report loaded, until it expires or the bot restarts
 
 #### `/reindex [source]` *(Admin only)*
 Re-index documentation vectors.
@@ -130,7 +166,7 @@ Re-index documentation vectors.
 - Per-source commit SHA tracking for granular updates
 
 #### `/memory <subcommand>` — Persistent Bot Memory
-The bot maintains long-term memories: atomic one-sentence facts about the server (guild-wide) or about individual users (scoped, privacy-guarded). Relevant memories are **automatically injected** into every `/ask`, `/chat` and @mention turn — the LLM doesn't need to search first.
+The bot maintains long-term memories: atomic one-sentence facts about the server (guild-wide) or about individual users (scoped, privacy-guarded). Relevant memories are **automatically injected** into every turn — the LLM doesn't need to search first. The bot's personality has its own place now ([`/persona`](#persona--personality)); `/persona importar` moves personality memories there.
 
 | Subcommand | Who | Description |
 |---|---|---|
@@ -151,12 +187,65 @@ The bot maintains long-term memories: atomic one-sentence facts about the server
 - **Pinning** — bot can pin too (`pinned=true` in `memory_write`, capped at `MEMORY_PIN_LIMIT`/guild, audited via `pinned_by`); admins pin/unpin without the cap
 - **Dedupe** — creates are refused when semantically similar (cosine ≥ `MEMORY_DEDUPE_THRESHOLD`) to an existing memory in the same scope; the LLM is told to `update` instead
 - **Single mutation path** — every write funnels through `MemoryStore`, which applies the change and records a before/after snapshot into `memory_history` in one SQLite transaction
+- **Who said it** — each memory records `told_by`, the person whose message led to it. A fact about someone told by someone else reaches the model as `… (segundo Fulano)` — a report, not something that person said — and `/memory show` lists it as *Contada por*. When the person restates it, `told_by` becomes them
+- **Episodes** — kind `episode` (*Conversa*): when a conversation expires, `EPISODES_MODEL` summarizes it in one or two sentences ("Conversa de 03/11/2026 com Ana: …; Ana ia testar o backup") and one memory is saved per participant (importance 2, newest `EPISODES_PER_USER` kept). Conversations with nothing worth remembering are skipped. Only the summarizer writes episodes; `memory_search` can filter them
 - **Rate guard** — bot writes capped at `MEMORY_BOT_WRITE_LIMIT`/hour per guild; `MEMORY_MAX_PER_SUBJECT` active memories per scope
 - **Transparency channel** — with `MEMORY_LOG_CHANNEL_ID` set, every mutation posts an embed with a **↩️ Reverter** button (admin-only, same guild)
 - **Privacy** — `/memory whoami` + `/memory forget-me` are self-service; purges hard-delete memories and their history
 - **One-time migration** — existing `lore.db` entries import automatically on first start (curated → pinned, pending skipped; `lore.db` is kept on disk untouched)
-- Tool errors degrade gracefully — memory failures return error strings to the LLM instead of aborting `/ask`/`/chat`
+- Tool errors degrade gracefully — memory failures return error strings to the LLM instead of aborting the turn
 - Set `MEMORY_ENABLED=false` to remove the tools and prompt guidance entirely
+
+#### `/persona` — Personality
+The bot's personality on each server, as a `<personalidade>` block in the system prompt (`core/persona.py`, `cogs/persona.py`). Unlike memories, it carries instruction weight, fits a whole document, can't be archived by a stray `memory_write`, and — since it rarely changes — stays inside the provider's prompt cache.
+
+| Section | What | Who changes it | Size |
+|---|---|---|---|
+| **Base** | Who the bot is: voice, humor, values, hard rules | Admins (`/persona editar`), or the bot when someone with **Manage Server** asks it to | `PERSONA_BASE_MAX_CHARS` (3000) |
+| **Notas** | What it picked up on the server: running jokes, nicknames, catchphrases | The bot itself (`persona_update`), at most `PERSONA_BOT_EDITS_PER_DAY` times a day; admins too | `PERSONA_NOTES_MAX_CHARS` (800) |
+
+| Subcommand | Who | Description |
+|---|---|---|
+| `/persona ver` | everyone | Both sections, their versions and who changed them last |
+| `/persona editar [secao]` | Manage Server | Edit a section in a text box pre-filled with the current text |
+| `/persona historico [secao]` | Manage Server | Last changes, with ids |
+| `/persona reverter <id>` | Manage Server | Put a section back to what it was before a change |
+| `/persona travar <sim/não>` | Manage Server | Stop (or allow again) the bot changing its own notes |
+| `/persona importar <ids>` | Manage Server | Append server memories (e.g. a pinned personality memory) to the base and unpin them |
+
+- **The tool** — `persona_update(section, content, reason)` replaces a whole section (the model rewrites it short instead of appending forever). A member asking to change the base is refused, and the model is told to suggest talking to an admin; "become someone else" requests are not a reason to touch the notes
+- **Audit** — every change is a new version with before/after (`persona_history`); with `PERSONA_LOG_CHANNEL_ID` (defaults to `MEMORY_LOG_CHANNEL_ID`) each one is posted with a **↩️ Reverter** button (admins of that server; the button lasts a day, `/persona reverter` always works)
+- Server memories that say how the bot should act still count, but the block is the place for it
+- Set `PERSONA_ENABLED=false` to remove the command, the tool and the block
+
+#### `/wrapped [periodo]` — Server Wrapped
+A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; or `14d`): messages and active members, who talked most, busiest channels, peak hour and weekday, who replied to whom most, favorite emojis (from messages and reactions) and the most-reacted messages with links, introduced in two or three lines in the bot's own voice. People are named, never pinged.
+
+- **Ask the bot:** the `server_wrapped` tool — "faz um wrapped do mês", "quem mais falou essa semana?"
+- **Automatic:** `/config servidor wrapped weekly|monthly` + `/config servidor wrapped_channel #canal` posts the last full week every Monday (or the last month on the 1st) at `WRAPPED_HOUR` (Brasília)
+- **Data:** messages from the history index; reactions from a `reactions` table recorded live since this version (no backfill), also queryable with `sql_history`
+- Set `WRAPPED_ENABLED=false` to remove the command, the tool and the automatic posts
+
+#### `/config` — Server and channel settings *(Manage Server)*
+| Subcommand | Description |
+|---|---|
+| `/config ver [canal]` | Effective settings of a channel (and where each comes from: channel, parent channel, server or default) plus the server settings |
+| `/config canal <opção> <valor> [canal]` | Set a channel's value (threads follow their parent channel) |
+| `/config servidor <opção> <valor>` | Set a server setting, or the default for every channel |
+| `/config limpar <opção> [canal]` | Back to the default |
+
+| Option | Scope | Values |
+|---|---|---|
+| `respond` | channel | `on` (mentions, replies, name calls, its threads), `mentions` (only mentions and replies), `off` (doesn't converse; slash commands still work) |
+| `name_trigger` | channel | answer when called by name without @ (default `CHAT_NAME_TRIGGER_ENABLED`) |
+| `threads` | channel | `auto`, `always`, `never` |
+| `reply_style` | channel | `auto`, `plain`, `embed` (default `CHAT_REPLY_STYLE`) |
+| `log_detection` | channel | react to log links, `.log`/`.txt` files and Spark links |
+| `instructions` | channel | text the model follows in that channel ("seja direto e técnico", "aqui é papo livre") |
+| `aliases` | server | extra names the bot answers to, comma-separated |
+| `wrapped`, `wrapped_channel` | server | automatic Wrapped: `off`/`weekly`/`monthly` and where |
+
+Stored in `SETTINGS_DB_PATH`.
 
 ---
 
@@ -179,7 +268,7 @@ The bot maintains long-term memories: atomic one-sentence facts about the server
 
 ## Passive Features
 
-The bot monitors every non-bot message via `on_message` listeners (load order: `log_analyzer` → `history_rag` → `commands` → `spark` → `docs_rag` → `monitors`).
+Every message goes through one router (`core/router.py`): passive *observers* see each message concurrently (history indexing, log and Spark detection), and *handlers* get human messages in priority order until one takes it — the chat engine first, monitors after. Load order doesn't matter.
 
 ### 1. Paste Service Link Detection (`log_analyzer`)
 - **Triggers on:** `https://mclo.gs/<id>` and `https://pastebin.com/<id>`
@@ -207,14 +296,16 @@ The bot monitors every non-bot message via `on_message` listeners (load order: `
 | Crash | `This crash report has been saved to`, `---- Minecraft Crash Report ----` |
 | Generic | `The received string length is longer than maximum allowed`, `Connection throttled` |
 
+Detection 1–2 and 4 are off in channels whose `log_detection` setting is off.
+
 ### 4. Spark URL Detection (`spark`)
 Regex `https://spark.lucko.me/<code>` → replies "🔥 Relatório Spark detectado!" with analysis button.
 
-### 5. Reply-Based Follow-Up Conversations (`docs_rag` + `commands`)
-Reply to any `/ask`, `/chat`, or `/spark` bot response to continue the thread. The bot replays up to 16 history turns (for `/ask`/`/spark`) with the Spark report carried forward. Per-user cooldown enforced. Supports image attachments in follow-ups.
+### 5. Conversations (`core/chat_engine.py`)
+Replies to the bot, @mentions, name calls and messages in its threads — see [Conversations](#conversations). Replies continue any conversation (`/chat`, `/ask`, Spark, monitors, scheduled posts, published summaries) on its own profile, replaying up to 16 history turns, with the Spark report carried forward. Supports image attachments.
 
-### 6. @Mention Chat (`commands`)
-Mention the bot with a question (`@QuillBot como otimizar meu servidor?`) — equivalent to `/chat` with the same tool loop and conversation storage. In a thread the bot opened, no mention is needed (see [chat threads](#chat-question-image)).
+### 6. Edits and Deletes (`cogs/chat.py`)
+Raw message delete/edit events: a deleted question takes its answer with it; an edit shortly after the answer re-answers it.
 
 ### 7. Monitors (`monitors`)
 Messages matching a monitor's filters run the bot on them like a mention, and it may choose not to answer — see [`/monitor`](#monitor-subcommand--monitors).
@@ -224,10 +315,27 @@ Background RAG over the entire Discord server's message history:
 - **Backfill** on startup: reads all accessible text channels/threads (oldest-first, configurable limit)
 - **Live ingestion:** Every new message is chunked with a 5-message sliding window for local context, embedded, and persisted per-guild (`data/history/<guild_id>.json + .npy`)
 - **Dedup + deletion:** Tracks `msg_id → index`, handles `on_message_delete`
+- **Reactions:** every reaction added/removed is recorded in a `reactions` table (for Wrapped and `sql_history`)
 - **Search tool:** `search_history` / `search_docs` equivalent available to the LLM in all agentic loops
 - **SQL tool:** `sql_history` — LLM-written analytical SELECTs over the history DB (exact counts, GROUP BY, mentions, replies, FTS5, REGEXP), sandboxed four ways: single-SELECT validation + guild scoping, read-only URI + `PRAGMA query_only`, `set_authorizer` (writes/ATTACH/PRAGMA denied, `chunks.embedding` never emitted), and a progress-handler timeout (`HISTORY_SQL_TIMEOUT_SECONDS`). Disable with `HISTORY_SQL_TOOL_ENABLED=false`; rows/output caps via `HISTORY_SQL_MAX_ROWS`.
 
 ---
+
+## Architecture
+
+Every feature talks to the others through shared services on `bot.services` (`core/services.py`), never through another cog's private methods:
+
+| Service | What it is |
+|---|---|
+| `llm` (`core/llm.py`) | The one OpenAI-compatible client: streamed completions retried on 429/timeouts/connection errors/5xx (`LLM_RETRY_*`), and embeddings (remote or the one shared local model) |
+| `tools` (`core/tools.py`) | Tool registry — each feature registers its tools (schema, coroutine, status line) when it loads |
+| `router` (`core/router.py`) | The single `on_message`: observers + handlers in priority order |
+| `settings` (`core/settings.py`) | Server/channel settings (`/config`) |
+| `conversations` (`core/conversations.py`) | The conversation store (one for every kind of conversation) |
+| `chat` (`core/chat_engine.py`) | The chat engine: answers messages, monitor hits, scheduled tasks, slash commands and Spark analyses; anchors conversations on posts |
+| `memory`, `history`, `docs`, `persona` | Set by those cogs when they load |
+
+A turn is one `TurnContext` (`core/turn.py`: who, where, the stored conversation, images, per-turn tool state) run by `core/runner.py:run_turn` with a **profile** (`core/profiles.py`): `chat` (mentions, replies, threads, name calls, `/chat`, monitors, scheduled tasks), `ask` (docs-first `/ask`) or `spark`. The profile picks the prompt (`core/prompts.py` — one role and one set of rules for all of them, plus the server's `<personalidade>` block), the tools by name in a fixed order, the model and how answers look; `core/delivery.py` then decides plain message vs embed vs thread.
 
 ## AI & RAG System
 
@@ -238,17 +346,17 @@ Background RAG over the entire Discord server's message history:
 - **Storage:** `data/vectors.json` (metadata) + `data/vectors.npy` (float32 binary embeddings) — migrated automatically from old JSON-embedded format
 - **Chunking:** Markdown split by headings (`##`/`#`), then by `1500`-char paragraph windows; title extracted from frontmatter or first `#`
 
-### Agentic Tool Loop (`cogs/utils.py:run_tool_loop`)
-Shared loop used by `/ask`, `/chat`, and Spark analysis:
+### Agentic Tool Loop (`core/tool_loop.py:run_tool_loop`)
+Shared loop used by every turn (`core/runner.py`):
 
 ```
-while tool_calls and rounds < MAX_TOOL_ROUNDS:
-  → display status label on deferred interaction
-  → execute each tool (deduplicate sources via dedup_key)
+while tool_calls and rounds < profile.max_rounds:
+  → show the tool's status line on a deferred slash command
+  → execute each tool through the registry (deduplicate sources by URL)
   → append tool results (truncated to 6000 chars)
 → final answer (max_tokens=`LLM_MAX_TOKENS`, default 8192)
 → if the answer comes back empty (e.g. a reasoning model spent the whole token budget thinking): one retry without tools + conciseness nudge, then fallback message
-→ paginated embeds + source pages
+→ core/delivery.py: plain message(s), or embeds + source pages
 ```
 
 - Parallel tool calls per round when the LLM requests multiple
@@ -259,12 +367,12 @@ Each turn captures the **exact rendered user message** plus the serialized inter
 Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis), so the replayed prefix only changes at deliberate collapse boundaries — not sliding every turn — which is what keeps the provider prefix cache effective. Explicit `cache_control` breakpoints mark the system prompt and the last replayed history message for Anthropic/Gemini via OpenRouter; OpenAI-compatible endpoints ignore them and cache automatically. Captured trajectories are sanitized on persist (no `reasoning`/thinking payloads, tool-call/result pairing enforced).
 
 ### Rate Limiting
-`COOLDOWN_RATE` / `COOLDOWN_PER` (default `1` per `30s`) per user on `/ask`, `/chat`, `/analyze`. Follow-up replies share a `TTLCache` cooldown. Exceeding returns an ephemeral `⏳ Aguarde Xs` message.
+Conversations (`/chat`, `/ask`, mentions, replies, name calls, monitors) use the sliding-window budgets `CHAT_USER_BUDGET` / `CHAT_GUILD_BUDGET` — over budget the bot reacts ⏳ (slash commands get an ephemeral notice); quick consecutive messages are merged into one turn, never dropped. `COOLDOWN_RATE` / `COOLDOWN_PER` (default `1` per `30s`) still apply per user to `/analyze`, `/spark`, `/resumo` and `/wrapped`.
 
 ### Context Injection
-Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
+Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context, plus a `<canal>` block with the channel's `instructions` setting when it has one.
 
-When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority, then the newest channel images); filenames remain visible in the text context. Only images posted within `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` (default `60`) are sent, and `CHANNEL_CONTEXT_IMAGES_ENABLED=false` turns channel images off entirely (use it with text-only `CHAT_MODEL`s). Attachments are downloaded once and reused by attachment id. Stickers (`[figurinha:Nome]`) and GIF/image link embeds (Tenor, Giphy, direct image links; `[gif: …]`) count as images too; animated GIFs and stickers are sent as one numbered sheet of four evenly spaced frames, and Tenor/Giphy links use a small animated rendition with the still preview as fallback. Lottie stickers are shown by name only. Custom emojis appear as `:nome:` in the text, and each message's custom emojis are drawn on one labelled sheet that only uses image slots left over after real media. The same media from the triggering message (and the message it replies to) is sent as the user's own images. Reactions are listed on each line before `msg_id` as `[reações: 👍 3 (Ana, Bruno +1)]`, with up to `REACTION_USERS_LIMIT` reactor names per reaction. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `30`), every conversational turn also receives a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, trimmed from the oldest side to `CHANNEL_CONTEXT_MAX_CHARS` (in a fast chat ten messages is a minute of talk, and what "esse sinal" points at can be further back), same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority, then the newest channel images); filenames remain visible in the text context. Only images posted within `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` (default `60`) are sent, and `CHANNEL_CONTEXT_IMAGES_ENABLED=false` turns channel images off entirely (use it with text-only `CHAT_MODEL`s). Attachments are downloaded once and reused by attachment id. Stickers (`[figurinha:Nome]`) and GIF/image link embeds (Tenor, Giphy, direct image links; `[gif: …]`) count as images too; animated GIFs and stickers are sent as one numbered sheet of four evenly spaced frames, and Tenor/Giphy links use a small animated rendition with the still preview as fallback. Lottie stickers are shown by name only. Custom emojis appear as `:nome:` in the text, and each message's custom emojis are drawn on one labelled sheet that only uses image slots left over after real media. The same media from the triggering message (and the message it replies to) is sent as the user's own images. Reactions are listed on each line before `msg_id` as `[reações: 👍 3 (Ana, Bruno +1)]`, with up to `REACTION_USERS_LIMIT` reactor names per reaction. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
 
 ### Prefix-Cache-Friendly Message Layout
 The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
@@ -301,32 +409,64 @@ Periodic reindex every `REINDEX_INTERVAL_HOURS` (default 6h) via composite MD5 o
 
 ```
 QuillBot/
-├── main.py               # Entrypoint — validates config, loads cogs in order, syncs slash commands
+├── main.py               # Entrypoint — validates config, builds bot.services, routes on_message, loads cogs, syncs slash commands
 ├── config.py             # Centralized env-var config, DOC_SOURCES, feature flags
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
+├── core/                 # Shared machinery (no Discord cogs)
+│   ├── services.py       # bot.services: llm, tools, router, settings, conversations, chat (+ memory/history/docs)
+│   ├── llm.py            # The one LLM client: streamed completions with retry, embeddings
+│   ├── tool_loop.py      # Agentic tool loop, text tool-call recovery, trajectory capture
+│   ├── tools.py          # Tool + ToolRegistry
+│   ├── turn.py           # TurnContext / TurnResult, [NO_REPLY] and the unaddressed-turn headers
+│   ├── profiles.py       # chat / ask / spark profiles (prompt, tools, model, look)
+│   ├── prompts.py        # System prompts (one voice) and the Spark diagnostic protocol
+│   ├── runner.py         # run_turn: builds the request (cache-friendly layout) and runs the loop
+│   ├── chat_engine.py    # When the bot talks, bursts, budget, conversations, delivery, edits/deletes
+│   ├── delivery.py       # Plain messages vs embeds vs threads; pings
+│   ├── router.py         # The single on_message: observers + handlers
+│   ├── burst.py          # Merging a person's quick consecutive messages
+│   ├── budget.py         # Per-person / per-server sliding-window budgets
+│   ├── settings.py       # Server/channel settings store
+│   ├── episodes.py       # Summaries of ended conversations → episode memories
+│   ├── persona.py        # Per-server personality sections, versions, the <personalidade> block
+│   ├── conversations.py  # Conversation store + history/current-message builders
+│   ├── context.py        # <contexto> block, channel history/window/gap fetchers
+│   ├── context_tools.py  # Core tools: channel history, server info, message context, reactions, threads, web
+│   ├── discord_text.py   # Mentions/pings, identity block, canonical message lines, splitting
+│   ├── chat_threads.py   # When conversations move into threads, the open_thread tool, bot-thread detection
+│   ├── message_media.py  # Stickers, GIFs, custom emojis, reactions, the add_reaction tool
+│   ├── image_store.py    # Persisted, re-encoded images for vision
+│   ├── tavily_tools.py   # Tavily web_search / web_extract
+│   ├── local_inference.py# Single-thread executor for local models
+│   └── ui.py             # PaginatedEmbedView, source pages
 ├── cogs/
-│   ├── commands.py       # /chat, /docs, /help, /flags, /plov, /plano, /health, /sync + @mention & reply follow-ups
-│   ├── chat_threads.py   # When chat conversations move into threads, the open_thread tool, bot-thread detection
-│   ├── docs_rag.py       # RAG pipeline — indexing, search, reranking, /ask, /reindex, agentic loop + Spark diagnosis
-│   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, per-guild vector stores
+│   ├── chat.py           # /chat, /ask, the chat router handler, edit/delete events, the episode worker
+│   ├── commands.py       # /docs, /help, /flags, /plov, /plano, /health, /sync
+│   ├── server_config.py  # /config — server and channel settings
+│   ├── persona.py        # /persona, the persona_update tool, change log with Revert
+│   ├── wrapped.py        # /wrapped, server_wrapped tool, automatic weekly/monthly recaps
+│   ├── docs_rag.py       # Docs RAG — indexing, search, reranking, /reindex, search_docs/search_plugins tools
+│   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, reactions, history tools, Wrapped stats
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
-│   ├── monitors.py       # /monitor + monitor_* tools — standing message triggers that run the chat pipeline and may stay silent
-│   ├── memory.py         # Persistent memory — auto-injection, LLM write tools, admin commands, audit history, log channel, lore migration
+│   ├── monitors.py       # /monitor + monitor_* tools — standing message triggers that run the chat engine and may stay silent
+│   ├── memory.py         # Persistent memory — auto-injection, tools, provenance, episodes, admin commands, audit history
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
 │   ├── summary.py        # /resumo + summarize_channel tool — period parsing, fetch, map-reduce summary, permission checks
-│   ├── spark.py          # /spark command + passive spark.lucko.me detection
+│   ├── scheduler.py      # /schedule + schedule_* tools — cron and one-shot tasks run by the chat engine
+│   ├── spark.py          # /spark, Spark tools, passive spark.lucko.me detection
 │   ├── spark_parser.py   # Spark JSON parsing, summary/detail builders, call-tree rendering
-│   ├── plugin_apis.py    # Shared Modrinth/Hangar/SpigotMC API helpers
-│   ├── tavily_tools.py   # Tavily web_search / web_extract tool definitions & execution
-│   └── utils.py          # Shared: truncate_safe, split_response, PaginatedEmbedView, context builders, run_tool_loop
+│   └── plugin_apis.py    # Shared Modrinth/Hangar/SpigotMC API helpers
 ├── responses/
 │   └── errors.py         # 25 compiled Minecraft error regex patterns + pt-BR responses
 ├── tests/                # pytest suite, one file per module/feature (see Tests)
 └── data/
     ├── vectors.json/.npy # Docs RAG vector store
     ├── memory.db          # Persistent memory (memories + history)
+    ├── settings.db        # /config settings
+    ├── persona.db         # Personality sections + history
+    ├── conversations.db   # Conversations (handles, triggers, episode state)
     ├── lore.db            # Legacy lore encyclopedia (kept as migration source)
     └── history/          # Per-guild history stores
 ```
@@ -375,6 +515,8 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `LLM_MAX_TOKENS` | `8192` | Max completion tokens for the tool loop. Reasoning models count thinking tokens against this |
 | `LLM_REASONING_EFFORT` | *(unset)* | Reasoning effort sent on every chat completion: `minimal`, `low`, `medium` or `high`. Unset omits the parameter entirely (providers/models that don't accept it reject the request) |
 | `LLM_CACHE_CONTROL` | `auto` | Explicit `cache_control` prompt-cache breakpoints on the system prompt and conversation tail. `auto` sends them only when `OPENAI_BASE_URL` is OpenRouter or the Merge Gateway (they forward them to Anthropic/Gemini); strict providers such as Mistral reject the field with a 422. `true`/`false` forces it on or off |
+| `LLM_RETRY_ATTEMPTS` | `3` | Total attempts for a chat completion on 429, timeouts, connection errors and 5xx (`1` disables retries) |
+| `LLM_RETRY_BASE_DELAY` | `1.0` | Seconds before the first retry, doubling after (a provider's `Retry-After` wins, capped at 10s) |
 | `MERGE_PRIORITY_ORDER` | `particle,wafer,fireworks,modal,zai` | When `OPENAI_BASE_URL` points at the Merge Gateway (merge.dev), every chat completion carries an inline `priority_order` so the gateway tries these vendors in order (failing over on throttles, outages and timeouts). Comma-separated vendor slugs, highest priority first; empty disables |
 | `SPARK_MODEL` | `google/gemini-2.5-pro` | Used only during active Spark sessions |
 | `EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Doc/history embedding model |
@@ -393,14 +535,26 @@ cp .env.example .env   # if available, otherwise create .env manually
 |---|---|---|
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
-| `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
-| `CHAT_MENTION_CONTINUE_ENABLED` | `true` | A mention continues the newest bot conversation within the last `CHANNEL_CONTEXT_MESSAGES` messages instead of starting a new one (a quoted message is added as context) |
+| `CHAT_MENTION_ENABLED` | `true` | Answer @mentions, name calls and messages in the bot's threads (`false` leaves only replies to the bot) |
+| `CHAT_NAME_TRIGGER_ENABLED` | `true` | Answer when called by name without @ (per channel: `/config canal name_trigger`) |
+| `CHAT_NAME_ALIASES` | — | Extra names the bot answers to, comma-separated (servers add theirs with `/config servidor aliases`) |
+| `CHAT_REPLY_STYLE` | `auto` | `auto` (plain messages; embeds for summaries, Spark, Wrapped and long answers), `plain` or `embed` (per channel: `reply_style`) |
+| `CHAT_PLAIN_MAX_CHARS` | `2000` | In `auto`, answers longer than this go in an embed |
+| `CHAT_BURST_SECONDS` | `2.5` | Quiet time after a person's last message before their burst is answered as one turn |
+| `CHAT_BURST_SHORT_SECONDS` | `6` | Wait instead while the burst only points at something (short, no image/link/reply), so the image sent right after joins it |
+| `CHAT_USER_BUDGET` / `CHAT_USER_BUDGET_WINDOW` | `8` / `300` | Answered turns per person per window in seconds (`0` = unlimited); over it the bot reacts ⏳ |
+| `CHAT_GUILD_BUDGET` / `CHAT_GUILD_BUDGET_WINDOW` | `150` / `3600` | Answered turns per server per window, monitor runs included (`0` = unlimited) |
+| `CHAT_DELETE_WITH_TRIGGER` | `true` | Deleting a message the bot answered deletes the answer |
+| `CHAT_EDIT_WINDOW_SECONDS` | `60` | Editing it within this many seconds of the answer re-answers it (`0` never) |
+| `CHAT_MENTION_CONTINUE_ENABLED` | `true` | A mention continues the newest bot conversation within the last `CHAT_MENTION_CONTINUE_WINDOW` (`10`) messages instead of starting a new one (a quoted message is added as context) |
 | `CHAT_THREADS_ENABLED` | `true` | Move long or off-topic chat conversations into threads; the bot answers un-mentioned messages in its threads |
 | `CHAT_THREAD_AFTER_TURNS` | `3` | Turn on which a conversation moves into a thread (`3` = the second follow-up; `0` never moves by length) |
 | `CHAT_THREAD_CHANNELS` | — | Comma-separated channel IDs where every conversation opens a thread on its first answer |
 | `CHAT_THREAD_TOOL_ENABLED` | `true` | Give the chat model the `open_thread` tool for off-topic questions and casual chat |
 | `CHAT_THREAD_ARCHIVE_MINUTES` | `60` | Idle minutes before a bot thread archives (Discord accepts `60`, `1440`, `4320`, `10080`; other values round up) |
-| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_MESSAGES` | `30` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_MAX_CHARS` | `6000` | Character budget of that window; the oldest lines are dropped first (`0` = no limit) |
+| `CHAT_MENTION_CONTINUE_WINDOW` | `10` | How many recent channel messages a mention looks back for the bot's conversation |
 | `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
 | `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |
 | `CHANNEL_CONTEXT_REACTIONS_ENABLED` | `true` | Show reactions on channel-context lines (history tool, recent window, follow-up gaps, message context) |
@@ -442,7 +596,8 @@ cp .env.example .env   # if available, otherwise create .env manually
 | Variable | Default | Description |
 |---|---|---|
 | `IMAGES_DIR` | `data/images` | Where downloaded images are persisted |
-| `IMAGE_MAX_SIDE` | `640` | Max dimension (px) of re-encoded JPEGs |
+| `IMAGE_MAX_SIDE` | `640` | Max dimension (px) of re-encoded JPEGs (channel-context images) |
+| `IMAGE_MAX_SIDE_SHOWN` | `1280` | Max dimension of images someone shows the bot — attached to the message it answers or the one that replies to, or to `/chat`, `/ask`, `/analyze` — so screenshots of text stay readable. They're labelled in the message as what the person is showing, apart from channel images |
 | `IMAGE_JPEG_QUALITY` | `80` | JPEG quality of re-encoded images |
 | `IMAGE_RETENTION_SECONDS` | `86400` | Stored images swept after this many seconds |
 | `CONVERSATIONS_IMAGE_TURNS` | `3` | Inline stored images only for the most recent N history turns (older become text markers) |
@@ -496,7 +651,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 |---|---|---|
 | `CONVERSATIONS_DB_PATH` | `data/conversations.db` | SQLite path for persisted conversations |
 | `CONVERSATIONS_TTL_SECONDS` | `1800` | Conversation expiry after **last activity** |
-| `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept per flow (chat/ask) |
+| `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept |
 | `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
 | `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
 | `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as text and vision `prior_context` (`0` disables) |
@@ -505,11 +660,28 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |
 | `CONVERSATIONS_TRAJECTORY_MAX_CHARS` | `120000` | Hard budget on the replayed trajectory payload; turns are collapsed to compact rendering when exceeded |
 
+### Personality, Episodes, Settings and Wrapped
+
+| Variable | Default | Description |
+|---|---|---|
+| `PERSONA_ENABLED` | `true` | The `<personalidade>` block, `/persona` and the `persona_update` tool |
+| `PERSONA_DB_PATH` | `data/persona.db` | Personality sections and their history |
+| `PERSONA_BASE_MAX_CHARS` / `PERSONA_NOTES_MAX_CHARS` | `3000` / `800` | Section sizes (at most 4000, Discord's text box limit) |
+| `PERSONA_BOT_EDITS_PER_DAY` | `5` | Times a day the bot may rewrite a server's notes on its own (`0` never) |
+| `PERSONA_LOG_CHANNEL_ID` | `MEMORY_LOG_CHANNEL_ID` | Where personality changes are posted with a Revert button |
+| `EPISODES_ENABLED` | `true` | Summarize expired conversations into one *conversa* memory per participant (needs `MEMORY_ENABLED`) |
+| `EPISODES_MODEL` | `SUMMARY_MODEL` → `CHAT_MODEL` | Model for those summaries |
+| `EPISODES_PER_USER` | `20` | Newest episodes kept per person (older ones archived) |
+| `EPISODES_INTERVAL_SECONDS` | `300` | How often expired conversations are summarized |
+| `SETTINGS_DB_PATH` | `data/settings.db` | `/config` settings |
+| `WRAPPED_ENABLED` | `true` | `/wrapped`, the `server_wrapped` tool and automatic recaps |
+| `WRAPPED_HOUR` | `10` | Brasília hour automatic recaps are posted (Mondays / the 1st) |
+
 ### Other
 
 | Variable | Default | Description |
 |---|---|---|
-| `COOLDOWN_RATE` | `1` | Allowed uses per cooldown window |
+| `COOLDOWN_RATE` | `1` | Allowed uses per cooldown window of `/analyze`, `/spark`, `/resumo`, `/wrapped` |
 | `COOLDOWN_PER` | `30` | Cooldown window in seconds (per user) |
 | `MAX_CONTENT_SIZE` | `5242880` | Max bytes fetched from paste services (5 MB) |
 | `MAX_LOG_CONTEXT` | `12000` | Max chars sent to LLM for log analysis |
@@ -540,12 +712,13 @@ python main.py
 On startup the bot:
 
 1. Validates `BOT_TOKEN` (exits if missing; warns if `TAVILY_API_KEY` missing while web search is enabled)
-2. Loads cogs in order: `log_analyzer` → `history_rag` → `commands` → `plugins` → `spark` → `docs_rag` → `memory` (first run imports legacy `lore.db` automatically)
-3. Loads cached vectors from disk or indexes all doc sources
-4. Starts periodic reindex loop + background history backfill
-5. Syncs slash commands with Discord
+2. Builds `bot.services` (LLM client, tool registry, router, settings, conversation store) and loads the settings
+3. Loads the cogs; each registers its tools, router observers/handlers and services (first run imports legacy `lore.db` automatically)
+4. Loads cached vectors from disk or indexes all doc sources
+5. Starts periodic reindex, background history backfill, the scheduler, the episode worker and automatic Wrapped
+6. Syncs slash commands with Discord
 
-> **Cog load order matters** — `log_analyzer`'s `on_message` (pattern matching) runs before `docs_rag`'s (follow-up replies). Do not reorder without reviewing listener interactions.
+Cog load order doesn't matter: the router decides who sees a message, not the order listeners were registered in.
 
 ---
 
@@ -575,22 +748,31 @@ pytest -k reindex              # tests whose name matches
 | `test_api_logger.py` | Request logging for aiohttp/httpx/httpx2, redaction, body capture, inbound interactions (runs in its own process) |
 | `test_attribution.py` | Author tags on every question, byte-identical replay of per-turn blocks, memory block labels and person-memory rules |
 | `test_channel_context_images.py` | Images from automatically fetched channel context |
-| `test_chat_threads.py` | When conversations move into threads, delivery and pings, reusing a moved conversation's thread, un-mentioned messages and silence in bot threads, the `open_thread` tool |
+| `test_chat_threads.py` | When conversations move into threads (incl. the `threads` setting), delivery and pings, reusing a moved conversation's thread, un-mentioned messages and silence in bot threads, the `open_thread` tool |
+| `test_context_and_requests.py` | The wider channel window and its budget, waiting for the image after "ai oh @bot", sharper shown images labelled apart from channel images, the search hint |
+| `test_conversation_flow.py` | Bursts, budget, name calls, aliases and `respond` settings, channel instructions, reply style, staying quiet, edits and deletes, `/chat` and `/ask` |
+| `test_delivery.py` | Plain vs embed, splitting long answers (code blocks stay valid), real pings for humans only, sources line, threads |
 | `test_conversation_participants.py` | Participant scope for shared conversations and memory writes |
 | `test_docs_rag.py` | Docs `/reindex`: partial and full reindex, failed sources kept |
 | `test_history_backfill.py` | History backfill watermarks and the duplicate-append guard |
 | `test_history_perf.py` | History search/indexing performance fixes (threading, FTS deletes, matrix buffer) |
 | `test_history_search.py` | FTS search, filters, dedupe, authors table, message context, `find_user` |
 | `test_history_sql.py` | The read-only `sql_history` tool and its sandbox |
+| `test_memory_provenance_episodes.py` | Who told a fact (`told_by`, "segundo Fulano"), episode memories with their cap, expired conversations waiting for their summary, the episode writer |
+| `test_mention_continuation.py` | A mention continues the bot's recent conversation (or not), with a quoted message as context |
 | `test_mentions.py` | Which mentions in a reply become real pings |
 | `test_message_media.py` | Stickers, GIFs, custom emojis, reactions and the `add_reaction` tool |
 | `test_monitors.py` | Monitor validation, filter matching, store, cooldowns, skipping messages the bot already answers, tools and permissions, silent vs. reply runs |
+| `test_persona.py` | Personality store and versions, the block in the system prompt, who may change base vs notes, daily limit and lock, revert and log, importing memories, the edit modal |
+| `test_runner.py` | The runner: docs tools in normal chat, profile tool order, server personality and channel instructions in the prompt, structured tools, LLM retries, status lines |
 | `test_scheduler.py` | Cron job firing and rescheduling |
+| `test_settings_router.py` | `/config` values and lookup order (channel → parent → server → default), the message router |
 | `test_summary.py` | `/resumo`: period parsing, fetching, map-reduce, permissions |
 | `test_tool_loop.py` | Tool errors reported to the model instead of aborting the turn |
 | `test_trajectory_replay.py` | Trajectory capture, verbatim replay, text tool-call recovery |
+| `test_wrapped.py` | Wrapped numbers, weekly/monthly schedule, automatic posts once per period, the tool |
 
-`tests/conftest.py` puts the repo root on the import path, runs `async def` tests without a plugin, and provides a `tmpdb` fixture. `tests/helpers.py` has `check(label, condition, detail)`, a labelled assert. New tests go in the file for the module they cover, or a new `test_<module>.py`.
+`tests/conftest.py` puts the repo root on the import path, runs `async def` tests without a plugin, and provides a `tmpdb` fixture. `tests/helpers.py` has `check(label, condition, detail)`, a labelled assert. `tests/chat_fakes.py` has fake Discord objects and `make_engine`, a real chat engine on temp stores whose turns answer from a script. New tests go in the file for the module they cover, or a new `test_<module>.py`.
 
 ---
 

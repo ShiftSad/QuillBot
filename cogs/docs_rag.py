@@ -1,5 +1,13 @@
+"""Documentation RAG: indexing the doc sources and searching them.
+
+Indexes Markdown from the configured GitHub repos (``DOC_SOURCES``) into an
+embedding matrix, keeps it fresh, and serves searches. The ``search_docs`` and
+``search_plugins`` tools it registers are offered to every conversation (not
+only ``/ask``), so the bot answers Minecraft questions from the docs wherever
+people ask them.
+"""
+
 import asyncio
-import datetime
 import hashlib
 import json
 import logging
@@ -10,234 +18,28 @@ import time
 import aiohttp
 import discord
 import numpy as np
-from cachetools import TTLCache
 from discord import app_commands
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI, RateLimitError
 
-from cogs import image_store as _image_store
-from cogs import message_media as _message_media
-from cogs.conversation_store import (
-    ConversationStore as _ConversationStore,
-    add_participants as _add_participants,
-    apply_cache_control as _apply_cache_control,
-    author_info as _author_info,
-    author_stamp as _author_stamp,
-    build_conversation_block as _build_conversation_block,
-    build_current_message as _build_current_message,
-    build_history_messages as _build_history_messages,
-    cap_turns as _cap_turns,
-    conversation_participant_ids as _conversation_participant_ids,
-    make_turn as _make_turn,
-    message_participant_infos as _message_participant_infos,
-    select_image_refs as _select_image_refs,
-)
-from cogs.local_inference import run_local_model
-from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
-from cogs.spark_parser import (
-    AVAILABLE_SECTIONS as _SPARK_SECTIONS,
-    SparkReport,
-    build_detail as _spark_build_detail,
-    build_summary as _spark_build_summary,
-)
-from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response, strip_bot_mention
-from cogs.utils import (
-    CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
-    COUNT_MENTIONS_TOOL as _COUNT_MENTIONS_TOOL,
-    FIND_USER_TOOL as _FIND_USER_TOOL,
-    GET_MESSAGE_CONTEXT_TOOL as _GET_MESSAGE_CONTEXT_TOOL,
-    GET_USER_STATS_TOOL as _GET_USER_STATS_TOOL,
-    GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
-    SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
-    SQL_HISTORY_TOOL as _SQL_HISTORY_TOOL,
-    build_full_context_block as _build_full_context_block,
-    build_identity_block as _build_identity_block,
-    exec_history_tool as _exec_history_tool,
-    fetch_recent_channel_context as _fetch_recent_channel_context,
-    fetch_turn_gap as _fetch_turn_gap,
-    history_tool_status as _history_tool_status,
-)
 from config import (
-    CHANNEL_CONTEXT_MESSAGES,
-    CHAT_MODEL,
-    COOLDOWN_PER,
-    COOLDOWN_RATE,
-    CONVERSATIONS_DB_PATH,
-    CONVERSATIONS_HISTORY_TURNS,
-    CONVERSATIONS_MAX_STORED,
-    CONVERSATIONS_MAX_TURNS,
-    CONVERSATIONS_TTL_SECONDS,
     DOC_SOURCES,
     DOCS_BASE_URL,
     DOCS_BRANCH,
-    EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
     GITHUB_API,
-    HISTORY_SQL_TOOL_ENABLED,
-    LOCAL_EMBEDDING_DEVICE,
-    LOCAL_EMBEDDING_MODEL,
-    MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
-    OPENROUTER_API_KEY,
-    REACTION_TOOL_ENABLED,
     REINDEX_INTERVAL_HOURS,
     RERANK_AVAILABLE,
     RERANK_MODEL,
-    SPARK_MODEL,
     VECTOR_STORE_PATH,
 )
+from core.tools import Tool
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
-_SPARK_REPORT_CACHE_SIZE = 32  # Parsed Spark reports kept for follow-ups
-
-
-_MEMORY_INSTRUCTIONS = (
-    "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
-    "injetado automaticamente no início de cada resposta. Use-o naturalmente — nunca "
-    "mencione o bloco nem os IDs [mem #N]. As memórias de cada pessoa ficam sob "
-    "\"Sobre Nome (@usuário) id=…\" — confira o id antes de atribuí-las. Para lembrar de algo não injetado, use "
-    "`memory_search`; para contextualizar quem é alguém, use `memory_about`.\n"
-    "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, evento "
-    "marcante, habilidade ensinada), salve com `memory_write` — uma frase autocontida por "
-    "memória, em terceira pessoa, citando o nome da pessoa; memórias sobre alguém sempre "
-    "com `about_user` = author_id dela. Atualize com action=update quando o fato mudar e use "
-    "action=forget quando deixar de valer. Use pinned=true só para fatos centrais e "
-    "permanentes.\n"
-) if MEMORY_ENABLED else ""
-
-_DISCORD_FORMAT_GUIDE = (
-    "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
-    "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
-    "```bloco de código``` com linguagem (yaml, properties, json, toml, bash, log), "
-    "> citação, - lista, 1. lista numerada, ||spoiler||, ### título / ## título, [texto](url).\n"
-    "- Proibido: tabelas markdown com |, separadores --- ou ***, HTML (<br>, <div>), LaTeX ($$), footnotes.\n"
-    "- Para comparações use listas com **Chave**: valor — NUNCA tabelas com pipes.\n"
-    "- Para títulos de seção use ### Título ou **Negrito** — nunca ---.\n"
-    "- Blocos de código sempre com linguagem para highlight; valores de config em ```yaml ou ```properties.\n"
-    "- Cite arquivos/chaves com `inline code` (ex: `paper.yml`, `view-distance`).\n"
-)
-
-SYSTEM_PROMPT = (
-    "<role>\n"
-    "Você é o assistente oficial do Miners' Refuge, uma comunidade brasileira de "
-    "administradores de servidores Minecraft. Responda sempre em português brasileiro.\n"
-    "</role>\n\n"
-    "<instructions>\n"
-    "- Para qualquer pergunta técnica sobre configuração, administração ou otimização de "
-    "servidores Minecraft, chame `search_docs` imediatamente.\n"
-    + _MEMORY_INSTRUCTIONS +
-    "- Baseie cada resposta nos dados retornados pelas ferramentas, não em conhecimento de treinamento.\n"
-    "- Se a pergunta for vaga ou ambígua, peça esclarecimentos — omita chamadas de ferramentas.\n"
-    "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "
-    f"Se nenhuma ferramenta retornar dados relevantes, diga que não encontrou e sugira visitar {DOCS_BASE_URL}.\n"
-    "- Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
-    "- Execute as ferramentas diretamente sem pedir autorização. "
-    "Se múltiplas buscas independentes forem necessárias, execute-as em paralelo na mesma rodada.\n"
-    "</instructions>\n\n"
-    "<response_format>\n"
-    + _DISCORD_FORMAT_GUIDE
-    + "</response_format>\n\n"
-    "<examples>\n"
-    "<example>\n"
-    "<user>Como configurar o view-distance para melhorar o desempenho?</user>\n"
-    "<assistant>\n"
-    "O `view-distance` controla quantos chunks ao redor de cada jogador o servidor processa. "
-    "Reduzi-lo é uma das formas mais eficazes de aliviar a carga.\n\n"
-    "**`server.properties`**\n"
-    "```properties\nview-distance=6\n```\n\n"
-    "**`paper-world-defaults.yml`** (Paper/Purpur)\n"
-    "```yaml\nchunks:\n  delay-chunk-unloads-by: 10s\n```\n\n"
-    "Para servidores com 20–50 jogadores, valores entre 6 e 8 oferecem bom equilíbrio.\n"
-    "</assistant>\n"
-    "</example>\n"
-    "<example>\n"
-    "<user>meu server tá com problema</user>\n"
-    "<assistant>\n"
-    "Para ajudar, preciso de mais detalhes:\n"
-    "- Qual versão e tipo de servidor (Paper, Purpur, Fabric)?\n"
-    "- O problema é lag, crash ou erro ao conectar?\n"
-    "- Você tem um log ou relatório do Spark para compartilhar?\n"
-    "</assistant>\n"
-    "</example>\n"
-    "</examples>"
-)
-# Appended to SYSTEM_PROMPT when a Spark report is active in the session.
-# Following Anthropic best-practice: XML tags separate role, instructions and
-# tool guidance; numbered steps encode the required diagnostic reasoning order.
-SPARK_SYSTEM_PROMPT_SUFFIX = (
-    "\n\n"
-    "<spark_analysis_context>\n"
-    "<role_extension>\n"
-    "Você também é um especialista em diagnóstico de desempenho de servidores "
-    "Minecraft. Um relatório do Spark Profiler foi carregado para esta conversa. "
-    "Seu objetivo é identificar a causa raiz de problemas de desempenho com base "
-    "nos dados do relatório. Seja preciso e fundamentado nos dados — não invente "
-    "valores de configuração.\n"
-    "</role_extension>\n\n"
-    "<diagnostic_protocol>\n"
-    "Ao analisar um relatório Spark, siga esta ordem:\n\n"
-    "1. **TPS** — O servidor está laggando? (< 20 TPS confirma lag; ≈ 20 TPS com "
-    "MSPT max alto indica spikes intermitentes.)\n"
-    "2. **MSPT median vs max** — Lag constante (median > 50 ms) ou spikes "
-    "intermitentes (median ok, max >> 50 ms)?\n"
-    "3. **Perfil de lag spike** — Se `tick_length_threshold_ms > 0`, os hotspots "
-    "mostram APENAS os ticks laggados, NÃO a carga normal. Adapte o diagnóstico: "
-    "100 % num perfil de spike ≠ servidor sempre a 100 %.\n"
-    "4. **`waitForNextTick()`** — Qual % do thread principal é sono?\n"
-    "   • ≥ 20 % → capacidade de sobra\n"
-    "   • < 20 % → trabalhando muito, vulnerável a spikes\n"
-    "   • < 5 % → provavelmente laggando constantemente\n"
-    "   • ≥ 80 % → servidor ocioso — perfil pode ter sido coletado no momento errado\n"
-    "5. **GC** — Pausas de GC coincidem com picos de MSPT? "
-    "Chame `get_spark_detail(\"jvm\")` se necessário.\n"
-    "6. **Hotspots** — Chame `get_spark_detail(\"hotspots\")` para a árvore completa. "
-    "Identifique os métodos com maior `self_pct` e cite o percentual exato de cada um "
-    "(ex: `EntityTick` → **73,2% self_pct**). Traduza o stack em causa raiz legível: "
-    "qual plugin, sistema ou entidade está consumindo CPU e exatamente quanto (%).\n"
-    "7. **Configuração** — Use `get_config_key(file, key)` para verificar o valor "
-    "atual da configuração suspeita.\n"
-    "8. **Recomendação fundamentada** — Chame `search_docs` para cada causa identificada, "
-    "independentemente de o servidor estar com lag ou não. "
-    "Se há problemas: busque valores recomendados (ex: 'entity activation range paper', 'villager lag'). "
-    "Se o servidor está saudável: confirme boas práticas (ex: 'paper performance best practices', 'view-distance recommendations'). "
-    "Nunca invente valores de configuração — toda recomendação deve vir dos resultados de `search_docs`.\n"
-    "</diagnostic_protocol>\n\n"
-    "<platform_awareness>\n"
-    "Antes de recomendar qualquer configuração, identifique a plataforma do servidor a partir do campo "
-    "'Software' no resumo do relatório:\n"
-    "- **Paper / Purpur / Folia**: configs paper.yml, spigot.yml, bukkit.yml, paper-world-defaults.yml existem.\n"
-    "- **Spigot / CraftBukkit**: spigot.yml e bukkit.yml existem; paper.yml NÃO existe.\n"
-    "- **Forge / NeoForge**: paper.yml, spigot.yml e bukkit.yml NÃO existem. "
-    "Use server.properties + configs de mods. Ao chamar `search_docs`, inclua o nome da plataforma na query "
-    "(ex: 'neoforge entity lag optimization', 'forge server performance').\n"
-    "- **Fabric / Quilt**: similar ao Forge — sem spigot.yml. Busque por mods de otimização (Lithium, Krypton).\n"
-    "- **Vanilla**: apenas server.properties.\n"
-    "NUNCA recomende arquivos de configuração que não existem para a plataforma identificada.\n"
-    "</platform_awareness>\n\n"
-    "<tool_guidance>\n"
-    "Use as ferramentas proativamente e na ordem indicada acima.\n"
-    "Prefira `get_config_key` quando precisar de apenas uma chave. "
-    "Use `get_spark_detail` para dados completos de uma seção.\n"
-    "Sempre baseie recomendações de configuração em `search_docs`, não em conhecimento de treinamento. "
-    "Para cada problema identificado nos hotspots, chame `search_docs` com uma query específica "
-    "(ex: 'villager lag optimization paper', 'entity activation range') — nunca invente valores.\n"
-    "</tool_guidance>\n\n"
-    "<spark_response_format>\n"
-    + _DISCORD_FORMAT_GUIDE
-    + "Regras adicionais para Spark:\n"
-    "- Liste métricas com **Negrito**: valor (ex: **TPS**: 18.5, **MSPT mediana**: 62 ms).\n"
-    "- Agrupe por seção com ### Título ou **Negrito** (ex: ### Diagnóstico).\n"
-    "- Ao citar hotspots, sempre inclua o percentual exato: `NomeDoMétodo` — **XX,X% self_pct**.\n"
-    "- Para cada problema: causa raiz + percentual de impacto + configuração atual + valor recomendado (da documentação).\n"
-    "- Valores de configuração sempre em bloco ```yaml / ```properties com linguagem.\n"
-    "</spark_response_format>\n"
-    "</spark_analysis_context>"
-)
 # --- Tool definitions for the LLM (OpenAI function-calling format) ---
 _SOURCE_LABELS = [src['label'] for src in DOC_SOURCES]
 _SOURCE_LABELS_STR = ', '.join(f'"{s}"' for s in _SOURCE_LABELS)
@@ -306,83 +108,17 @@ TOOLS = [
         },
     },
 ]
-if MEMORY_ENABLED:
-    TOOLS.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
-TOOLS.extend([
-    _CHANNEL_HISTORY_TOOL,
-    _GUILD_INFO_TOOL,
-    _SEARCH_HISTORY_TOOL,
-    _GET_MESSAGE_CONTEXT_TOOL,
-    _GET_USER_STATS_TOOL,
-    _COUNT_MENTIONS_TOOL,
-    _FIND_USER_TOOL,
-])
-if HISTORY_SQL_TOOL_ENABLED:
-    TOOLS.append(_SQL_HISTORY_TOOL)
-if REACTION_TOOL_ENABLED:
-    TOOLS.append(_message_media.ADD_REACTION_TOOL)
 
-# Additional tools injected only when a Spark report is active in the session.
-_SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)
-SPARK_TOOLS = [
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_spark_detail',
-            'description': (
-                'Retorna dados detalhados de uma seção específica do relatório Spark '
-                'atualmente carregado. Use para obter informações além do resumo inicial. '
-                f'Seções disponíveis: {_SPARK_SECTIONS_STR}. '
-                'Use "hotspots" para identificar gargalos na árvore de chamadas completa. '
-                'Use "jvm" para verificar GC e flags da JVM. '
-                'Use "profiler" para estatísticas TPS/MSPT por janela de tempo. '
-                'Use "configs:<arquivo>" para obter um arquivo de configuração específico '
-                '(ex: "configs:server.properties", "configs:paper/").'
-            ),
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'section': {
-                        'type': 'string',
-                        'description': (
-                            'Nome da seção a retornar. Use "configs:<arquivo>" para '
-                            'configurações por arquivo (ex: "configs:spigot.yml").'
-                        ),
-                    },
-                },
-                'required': ['section'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'get_config_key',
-            'description': (
-                'Lê uma única chave de configuração do servidor sem buscar o arquivo inteiro. '
-                'Use quando só precisar verificar um valor específico antes de recomendar uma mudança. '
-                'Mais eficiente que get_spark_detail para consultas pontuais.'
-            ),
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'file': {
-                        'type': 'string',
-                        'description': (
-                            'Nome do arquivo de configuração '
-                            '(ex: "server.properties", "spigot.yml", "paper/").'
-                        ),
-                    },
-                    'key': {
-                        'type': 'string',
-                        'description': 'Nome da chave de configuração a consultar.',
-                    },
-                },
-                'required': ['file', 'key'],
-            },
-        },
-    },
-]
+
+def _search_docs_status(args: dict, ctx) -> str:
+    label = f"🔍 Pesquisando documentação: *{str(args.get('query', ''))[:60]}*"
+    if args.get('source'):
+        label += f" ({args['source']})"
+    return label
+
+
+def _search_plugins_status(args: dict, ctx) -> str:
+    return f"🔌 Pesquisando plugins: *{str(args.get('query', ''))[:60]}*"
 
 
 def _parse_frontmatter(content: str) -> dict:
@@ -435,25 +171,13 @@ def path_to_docs_url(path: str) -> str:
     return _compute_doc_url(path, DOCS_BASE_URL)
 
 
+
 class DocsRAG(commands.Cog):
-    """RAG-powered documentation search and Q&A with vector storage and reranking."""
+    """RAG-powered documentation search with vector storage and reranking."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.client: AsyncOpenAI | None = None
-        api_key = OPENAI_API_KEY or "not-needed"
-        try:
-            self.client = AsyncOpenAI(
-                base_url=OPENAI_BASE_URL,
-                api_key=api_key,
-            )
-            if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
-                logger.warning("OPENAI_API_KEY/OPENROUTER_API_KEY not set -- LLM calls will fail until configured")
-        except Exception:
-            logger.exception("Failed to initialize OpenAI client")
-            self.client = None
-        self._local_embed_model = None
-        self._local_embed_dim: int | None = None
+        self.services = bot.services
         self.session: aiohttp.ClientSession | None = None
         self.chunks: list[dict] = []  # {content, path, title, source, doc_url}; embeddings live only in _emb_matrix
         self._last_commit_sha: str | None = None
@@ -462,51 +186,18 @@ class DocsRAG(commands.Cog):
         # Per-source SHA tracking for granular reindex
         self._source_shas: dict[str, str] = {}  # label -> latest commit SHA
         self._source_last_index: dict[str, float] = {}  # label -> timestamp
-        # Persistent conversations with activity-based TTL (survive restarts)
-        self.store = _ConversationStore(
-            CONVERSATIONS_DB_PATH,
-            kind='ask',
-            ttl_seconds=CONVERSATIONS_TTL_SECONDS,
-            max_stored=CONVERSATIONS_MAX_STORED,
-        )
-        # Spark reports are too heavy to persist — kept in memory per conversation.
-        # Bounded and expiring with the conversation TTL (each follow-up re-sets
-        # the entry, refreshing it) so parsed reports never pile up in RAM.
-        self._spark_by_conv: TTLCache = TTLCache(
-            maxsize=_SPARK_REPORT_CACHE_SIZE, ttl=CONVERSATIONS_TTL_SECONDS,
-        )
-        # Per-user follow-up cooldown (same period as slash commands)
-        self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
-
-    def _get_local_model(self):
-        if self._local_embed_model is not None:
-            return self._local_embed_model
-        try:
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading local embedding model: %s (device=%s)", LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DEVICE)
-            self._local_embed_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL, device=LOCAL_EMBEDDING_DEVICE)
-            test_emb = self._local_embed_model.encode(["test"], normalize_embeddings=True)
-            self._local_embed_dim = test_emb.shape[1] if hasattr(test_emb, 'shape') else len(test_emb[0])
-            logger.info("Local embedding model loaded (dim=%s)", self._local_embed_dim)
-        except ImportError:
-            logger.error("sentence-transformers not installed -- install with pip install sentence-transformers to use EMBEDDING_PROVIDER=local")
-            raise
-        except Exception:
-            logger.exception("Failed to load local embedding model %s", LOCAL_EMBEDDING_MODEL)
-            raise
-        return self._local_embed_model
-
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession(
             headers=_HTTP_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
         )
-        if EMBEDDING_PROVIDER == 'local':
-            try:
-                await run_local_model(self._get_local_model)
-            except Exception:
-                logger.warning("Falling back to remote embeddings due to local model load failure")
+        self.services.docs = self
+        self.services.tools.register(
+            Tool('search_docs', TOOLS[0], self._tool_search_docs, _search_docs_status),
+            Tool('search_plugins', TOOLS[1], self._tool_search_plugins, _search_plugins_status),
+        )
+        await self.services.llm.warm_up()
         loaded = await asyncio.to_thread(self._load_vectors)
         if not loaded:
             await self.index_docs()
@@ -514,21 +205,29 @@ class DocsRAG(commands.Cog):
 
     async def cog_unload(self):
         self.periodic_reindex.cancel()
+        self.services.tools.unregister('search_docs', 'search_plugins')
+        if self.services.docs is self:
+            self.services.docs = None
         if self.session:
             await self.session.close()
 
-    # --- Cooldown error handler ---
+    # --- Public state (used by /docs and /health) ---
 
-    async def cog_app_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ):
-        if isinstance(error, app_commands.CommandOnCooldown):
-            await interaction.response.send_message(
-                f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
-                ephemeral=True,
-            )
-        else:
-            raise error
+    @property
+    def indexing(self) -> bool:
+        return self._indexing
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.chunks)
+
+    @property
+    def last_commit_sha(self) -> str | None:
+        return self._last_commit_sha
+
+    @property
+    def source_last_index(self) -> dict[str, float]:
+        return dict(self._source_last_index)
 
     # --- Vector Storage ---
 
@@ -574,10 +273,11 @@ class DocsRAG(commands.Cog):
                         len(embeddings), len(chunks),
                     )
                     return False
-                if EMBEDDING_PROVIDER == 'local' and self._local_embed_dim and embeddings.shape[1] != self._local_embed_dim:
+                local_dim = self.services.llm.local_dim
+                if EMBEDDING_PROVIDER == 'local' and local_dim and embeddings.shape[1] != local_dim:
                     logger.warning(
                         "Embedding dim mismatch (stored %d vs local model %d), will reindex",
-                        embeddings.shape[1], self._local_embed_dim,
+                        embeddings.shape[1], local_dim,
                     )
                     return False
             elif chunks and 'embedding' in chunks[0]:
@@ -731,20 +431,7 @@ class DocsRAG(commands.Cog):
         return result
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        if EMBEDDING_PROVIDER == 'local':
-            embeddings = await run_local_model(
-                lambda: self._get_local_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
-            )
-            if hasattr(embeddings, 'tolist'):
-                return embeddings.tolist()
-            return [list(e) for e in embeddings]
-        if not self.client:
-            raise RuntimeError("OpenAI client not initialized -- check OPENAI_API_KEY / OPENAI_BASE_URL")
-        response = await self.client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=texts,
-        )
-        return [d.embedding for d in response.data]
+        return await self.services.llm.embed(texts)
 
     async def _fetch_doc(
         self, path: str, github_raw: str, semaphore: asyncio.Semaphore
@@ -1023,691 +710,46 @@ class DocsRAG(commands.Cog):
         reranked = await self._rerank(query, candidates, top_n=top_k)
         return reranked
 
-    # --- Slash Commands ---
 
-    @app_commands.command(name='ask', description='Pergunte algo sobre administração de servidores Minecraft')
-    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
-    @app_commands.describe(
-        question='Sua pergunta',
-        image='Imagem/screenshot para análise (opcional)',
-    )
-    async def ask(
-        self,
-        interaction: discord.Interaction,
-        question: str,
-        image: discord.Attachment | None = None,
-    ):
-        if not self.client:
-            await interaction.response.send_message(
-                '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
-            )
-            return
+    # --- LLM tools ---
 
-        if self._indexing:
-            await interaction.response.send_message(
-                '📚 A documentação está sendo indexada, tente novamente em alguns instantes.',
-                ephemeral=True,
-            )
-            return
-
-        image_url = None
-        if image:
-            if not image.content_type or not image.content_type.startswith('image/'):
-                await interaction.response.send_message(
-                    'O arquivo enviado não é uma imagem válida.', ephemeral=True
-                )
-                return
-
-        await interaction.response.defer(thinking=True)
+    async def _tool_search_docs(self, ctx, args: dict) -> tuple[str, list[dict]]:
+        if self._indexing and not self.chunks:
+            return 'A documentação está sendo indexada; tente de novo em instantes.', []
+        query = args.get('query', '')
         try:
-            await interaction.edit_original_response(content='💭 Pensando…')
-        except discord.HTTPException:
-            pass
-
-        if image:
-            image_url = await _image_store.persist_attachment(image)
-
-        logger.info(
-            "Processing /ask user=%s guild=%s question=%r",
-            interaction.user.id, interaction.guild_id, question[:80],
-        )
-
-        try:
-            answer, embeds, sources, capture = await self._run_agent(
-                question, image_url=image_url, interaction=interaction
-            )
-            # Clear any in-progress status message before sending the final embed.
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            if len(embeds) == 1:
-                msg = await interaction.followup.send(embed=embeds[0], wait=True)
-            else:
-                msg = await interaction.followup.send(
-                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
-                )
-            await self._store_conversation(
-                msg, question, answer, sources=sources, interaction=interaction,
-                capture=capture,
-            )
-
-        except RateLimitError:
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            await interaction.followup.send(
-                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
-            )
-        except Exception:
-            logger.exception("Error in /ask command")
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            await interaction.followup.send(
-                'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
-            )
-
-    # --- Tool execution ---
-
-    async def _exec_tool(
-        self,
-        name: str,
-        args: dict,
-        spark_report: SparkReport | None = None,
-        bot: discord.Client | None = None,
-        channel: discord.abc.Messageable | None = None,
-        guild: discord.Guild | None = None,
-        user: discord.abc.User | discord.Member | None = None,
-        origin: str | None = None,
-        participant_ids: set[str] | None = None,
-        reaction_tool: _message_media.ReactionTool | None = None,
-    ) -> tuple[str, list[dict]]:
-        """Execute a tool call and return (result_text, source_chunks)."""
-        if name == 'add_reaction':
-            if reaction_tool is None:
-                return 'Reações não disponíveis aqui.', []
-            return await reaction_tool(args), []
-        if name in ('memory_search', 'memory_write', 'memory_about'):
-            mem_cog = self.bot.get_cog('Memory')
-            if not mem_cog:
-                return 'Memória não disponível.', []
-            if not guild:
-                return 'Memória requer estar em um servidor.', []
-            actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
-            return await mem_cog.exec_tool(
-                name, args, guild=guild, actor_name=actor_name,
-                requester=user, channel=channel,
-                origin=origin,
-                participant_ids=participant_ids,
-            )
-
-        if name == 'search_docs':
-            query = args.get('query', '')
             top_k = max(1, min(12, int(args.get('max_results', 5))))
-            source_filter = args.get('source') or None
-            results = await self.search(query, top_k=top_k, source_filter=source_filter)
-            if not results:
-                return 'Nenhum resultado encontrado na documentação.', []
-            parts = []
-            for r in results:
-                doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-                parts.append(f"[Fonte: {r['title']} — {doc_url}]\n{r['content']}")
-            return '\n\n---\n\n'.join(parts), results
-
-        if name == 'search_plugins':
-            query = args.get('query', '')
-            results = await _search_plugins_all(self.session, query)
-            if not results:
-                return 'Nenhum plugin encontrado.', []
-            lines = []
-            for r in results[:6]:
-                versions = ', '.join(str(v) for v in r.get('versions', [])[:3]) or '—'
-                lines.append(
-                    f"**{r['name']}** ({r['source']}) — {r.get('description', '')}\n"
-                    f"Downloads: {r.get('downloads', 0):,} | Versões: {versions}\n"
-                    f"URL: {r['url']}"
-                )
-            return '\n\n'.join(lines), []
-
-        result = await _exec_history_tool(name, args, bot=bot or self.bot, guild=guild, channel=channel)
-        if result is not None:
-            return result
-
-        if name == 'get_spark_detail':
-            if spark_report is None:
-                return 'Nenhum relatório Spark carregado para esta conversa.', []
-            section = args.get('section', '')
-            return _spark_build_detail(spark_report, section), []
-
-        if name == 'get_config_key':
-            if spark_report is None:
-                return 'Nenhum relatório Spark carregado para esta conversa.', []
-            file_name = args.get('file', '')
-            key = args.get('key', '')
-            cfg = spark_report.configs.get(file_name)
-            if cfg is None:
-                available = ', '.join(spark_report.configs.keys()) or 'none'
-                return (
-                    f'Arquivo "{file_name}" não encontrado. '
-                    f'Disponíveis: {available}'
-                ), []
-            if isinstance(cfg, dict):
-                if key not in cfg:
-                    return f'Chave "{key}" não encontrada em "{file_name}".', []
-                value = cfg[key]
-                return f'{file_name}/{key} = {json.dumps(value)}', []
-            return f'{file_name} = {cfg}', []
-
-        return f'Ferramenta desconhecida: {name}', []
-
-    # --- Status helpers ---
-
-    @staticmethod
-    def _status_label(tool_name: str, args: dict) -> str:
-        """Return a short Portuguese status string shown while a tool runs."""
-        if tool_name == 'search_docs':
-            query = args.get('query', '')
-            source = args.get('source')
-            label = f'🔍 Pesquisando documentação: *{query[:60]}*'
-            if source:
-                label += f' ({source})'
-            return label
-        if tool_name == 'search_plugins':
-            query = args.get('query', '')
-            return f'🔌 Pesquisando plugins: *{query[:60]}*'
-        label = _history_tool_status(tool_name, args)
-        if label is not None:
-            return label
-        if tool_name == 'add_reaction':
-            return _message_media.reaction_tool_status(args)
-        if tool_name == 'memory_search':
-            return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
-        if tool_name == 'memory_write':
-            act = args.get('action', 'write')
-            tgt = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
-            return f'🧠 Memória — {act}: *{tgt}*'
-        if tool_name == 'memory_about':
-            return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
-        if tool_name == 'get_spark_detail':
-            section = args.get('section', '')
-            section_names = {
-                'hotspots': 'árvore de hotspots CPU',
-                'jvm': 'flags JVM e GC',
-                'profiler': 'estatísticas TPS/MSPT',
-                'configs': 'arquivos de configuração',
-                'game_rules': 'game rules',
-                'world': 'dados de mundo',
-                'plugins': 'plugins',
-            }
-            if section.startswith('configs:'):
-                file = section[len('configs:'):]
-                return f'📂 Lendo configuração: `{file}`'
-            readable = section_names.get(section, section)
-            return f'📊 Analisando relatório Spark — {readable}'
-        if tool_name == 'get_config_key':
-            file = args.get('file', '')
-            key = args.get('key', '')
-            return f'⚙️ Verificando `{key}` em `{file}`'
-        return f'🔧 Executando: {tool_name}'
-
-    # --- Agentic loop ---
-
-    async def _run_agent(
-        self,
-        question: str,
-        history: list[dict] | None = None,
-        image_url: str | None = None,
-        image_urls: list[str] | None = None,
-        spark_report: SparkReport | None = None,
-        reply_to: str | None = None,
-        title: str | None = None,
-        interaction: discord.Interaction | None = None,
-        user: discord.abc.User | discord.Member | None = None,
-        guild: discord.Guild | None = None,
-        channel: discord.abc.Messageable | None = None,
-        created_at: datetime.datetime | None = None,
-        participant_ids: set[str] | None = None,
-        origin: str | None = None,
-        context_message: discord.Message | None = None,
-        prior_context: list[str] | None = None,
-        context_image_urls: list[str] | None = None,
-    ) -> tuple[str, list[discord.Embed], list[dict], dict]:
-        """Run the LLM with tool-calling in a loop until it produces a final answer.
-
-        When ``spark_report`` is provided the agent uses ``SPARK_MODEL``,
-        receives the report summary as a synthetic prior exchange, and gains
-        access to the ``get_spark_detail`` / ``get_config_key`` Spark tools.
-        """
-        # Resolve context from interaction if not explicitly passed
-        if interaction is not None:
-            user = user or interaction.user
-            guild = guild or interaction.guild
-            channel = channel or interaction.channel
-            created_at = created_at or interaction.created_at
-        # Build system prompt ----------------------------------------------------
-        system_content = SYSTEM_PROMPT
-        if spark_report is not None:
-            system_content += SPARK_SYSTEM_PROMPT_SUFFIX
-            if spark_report.tick_length_threshold_ms > 0:
-                system_content += (
-                    '\n\n<lag_spike_warning>\n'
-                    f'ATENÇÃO: Este é um PERFIL DE LAG SPIKE '
-                    f'(--only-ticks-over {spark_report.tick_length_threshold_ms}ms). '
-                    'Os hotspots representam a CAUSA dos spikes, NÃO a carga normal do servidor. '
-                    '100% num perfil de lag spike ≠ o servidor está sempre a 100% — significa que '
-                    'aquele método estava presente em todos os ticks que laggaram. '
-                    'Não sugira otimizações gerais de desempenho como resposta primária.\n'
-                    '</lag_spike_warning>'
-                )
-        identity = _build_identity_block(self.bot.user, guild)
-        if identity:
-            system_content += '\n\n' + identity
-        history = history or []
-        if history:
-            # Full history (not the replay window): the block must only change
-            # when participants/channel actually change, or the system prompt
-            # would mutate every turn past the window and bust the cache.
-            system_content += '\n\n' + _build_conversation_block(history)
-
-        # Inject persistent memory (pinned + semantically selected) ----------------
-        # Memory selection and the recent channel window are per-request, so
-        # they ride on the final user message (with the clock-bearing context
-        # block) instead of the system prompt. This keeps the system prompt and
-        # replayed history byte-identical across follow-ups, making provider
-        # prefix caching effective.
-        context_blocks: list[str] = []
-        context_images = [u for u in (context_image_urls or []) if u]
-        if MEMORY_ENABLED and guild is not None:
-            mem_cog = self.bot.get_cog('Memory')
-            if mem_cog is not None:
-                try:
-                    mem_block = await mem_cog.build_memory_block(
-                        guild.id, question,
-                        speaker_id=str(user.id) if user is not None else None,
-                        participant_ids=participant_ids,
-                        for_label=_author_stamp(
-                            _author_info(user), created_at.timestamp() if created_at else None,
-                        ) if user is not None else None,
-                    )
-                    if mem_block:
-                        context_blocks.append(mem_block)
-                except Exception:
-                    logger.exception('Failed to build memory block for _run_agent')
-
-        # Recent channel messages as conversation context ------------------------
-        # (skipped when the turn's own channel gap was captured as prior_context)
-        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
-            try:
-                chan_ctx = await _fetch_recent_channel_context(
-                    self.bot, channel, before=context_message,
-                )
-                if chan_ctx:
-                    context_blocks.append(chan_ctx.text)
-                    context_images.extend(chan_ctx.images)
-            except Exception:
-                logger.exception('Failed to build recent channel context for _run_agent')
-
-        # Cache breakpoint after the full system prompt so the entire static
-        # instruction block is cached (Gemini/Anthropic via OpenRouter or the
-        # Merge Gateway; omitted elsewhere, see LLM_CACHE_CONTROL).
-        messages: list[dict] = [_apply_cache_control({'role': 'system', 'content': system_content})]
-
-        # Inject user/guild/channel/temporal awareness ---------------------------
-        # This block carries the current clock, so it rides on the final user
-        # message (context_blocks) instead of a message before the history —
-        # placing it before the history would defeat prefix caching.
-        if user or guild or channel or created_at:
-            try:
-                ctx_block = _build_full_context_block(user, guild, channel, created_at)
-                if ctx_block:
-                    context_blocks.insert(0, ctx_block)
-            except Exception:
-                logger.exception("Failed to build context block for _run_agent")
-
-        # Inject Spark report summary as a synthetic prior exchange --------------
-        # Per Anthropic long-context guidance: put data before the user question.
-        if spark_report is not None:
-            summary_text = (
-                '[Relatório Spark carregado]\n\n'
-                + _spark_build_summary(spark_report)
-            )
-            # Cache the report summary so the agentic tool-call loop reuses
-            # it from cache on every subsequent round without re-billing.
-            messages.append(_apply_cache_control({'role': 'user', 'content': summary_text}))
-            messages.append({
-                'role': 'assistant',
-                'content': (
-                    'Entendido. Analisei o resumo do relatório Spark e estou pronto '
-                    'para diagnosticar.'
-                ),
+        except (TypeError, ValueError):
+            top_k = 5
+        results = await self.search(query, top_k=top_k, source_filter=args.get('source') or None)
+        if not results:
+            return 'Nenhum resultado encontrado na documentação.', []
+        parts = []
+        sources = []
+        for r in results:
+            doc_url = r.get('doc_url', path_to_docs_url(r['path']))
+            parts.append(f"[Fonte: {r['title']} — {doc_url}]\n{r['content']}")
+            sources.append({
+                'title': r['title'] or _title_from_path(r['path']),
+                'url': doc_url,
+                'source': r.get('source', "Miners' Refuge"),
+                'path': r['path'],
             })
+        return '\n\n---\n\n'.join(parts), sources
 
-        # Replay conversation history --------------------------------------------
-        if history:
-            messages.extend(
-                _build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
+    async def _tool_search_plugins(self, ctx, args: dict) -> tuple[str, list[dict]]:
+        results = await _search_plugins_all(self.session, args.get('query', ''))
+        if not results:
+            return 'Nenhum plugin encontrado.', []
+        lines = []
+        for r in results[:6]:
+            versions = ', '.join(str(v) for v in r.get('versions', [])[:3]) or '—'
+            lines.append(
+                f"**{r['name']}** ({r['source']}) — {r.get('description', '')}\n"
+                f"Downloads: {r.get('downloads', 0):,} | Versões: {versions}\n"
+                f"URL: {r['url']}"
             )
-            # Breakpoint at the end of the replayed conversation: the current
-            # question and its per-request blocks ride after it.
-            messages[-1] = _apply_cache_control(messages[-1])
-
-        # Current user message ---------------------------------------------------
-        urls: list[str] = []
-        if image_urls:
-            urls.extend([u for u in image_urls if u])
-        elif image_url:
-            urls.append(image_url)
-        current_message = _build_current_message(
-            question,
-            author=_author_info(user or (interaction.user if interaction else None)),
-            ts=created_at.timestamp() if created_at else None,
-            image_urls=urls,
-            reply_to=reply_to,
-            prior_context=prior_context,
-            channel_id=getattr(channel, 'id', None),
-            context_blocks='\n\n'.join(context_blocks) or None,
-            context_image_urls=context_images,
-        )
-        messages.append(current_message)
-
-        # Choose model and tool set based on session type ------------------------
-        model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
-        active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
-
-        reaction_tool = _message_media.ReactionTool(
-            channel, guild=guild, default_message=context_message,
-        )
-        exec_tool = (
-            lambda name, args: self._exec_tool(
-                name, args, spark_report=spark_report, bot=self.bot, channel=channel,
-                guild=guild, user=user, origin=origin, participant_ids=participant_ids,
-                reaction_tool=reaction_tool,
-            )
-        )
-
-        answer, all_sources, trajectory = await run_tool_loop(
-            client=self.client,
-            model=model,
-            messages=messages,
-            tools=active_tools,
-            exec_tool=exec_tool,
-            status_label=self._status_label,
-            interaction=interaction,
-            max_rounds=MAX_TOOL_ROUNDS,
-            dedup_key=lambda s: s.get('path', ''),
-        )
-
-        # Build source links (attached to first page only) -----------------------
-        source_lines: list[str] = []
-        sources: list[dict] = []
-        if all_sources:
-            seen_paths: set[str] = set()
-            for r in all_sources:
-                if r['path'] not in seen_paths:
-                    seen_paths.add(r['path'])
-                    doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-                    doc_title = r['title'] or _title_from_path(r['path'])
-                    source_label = r.get('source', "Miners' Refuge")
-                    source_lines.append(f'• [{doc_title}]({doc_url}) — {source_label}')
-                    sources.append({'title': str(doc_title)[:100], 'url': doc_url})
-
-        # Build paginated embeds -------------------------------------------------
-        embed_title = title or f'❓ {question}'
-        pages = split_response(answer)
-        total = len(pages)
-        footer_base = (
-            f"Documentação • {DOCS_BASE_URL} • "
-            "💬 Responda a esta mensagem para continuar a conversa"
-        )
-        embeds: list[discord.Embed] = []
-        for i, page_text in enumerate(pages):
-            e = discord.Embed(
-                title=embed_title if i == 0 else '',
-                description=page_text,
-                color=discord.Color.orange() if spark_report is not None else discord.Color.blue(),
-            )
-            e.set_footer(
-                text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
-            )
-            embeds.append(e)
-
-        if source_lines:
-            embed_color = discord.Color.orange() if spark_report is not None else discord.Color.blue()
-            embeds.extend(
-                build_source_pages(
-                    source_lines,
-                    title='📄 Fontes da Documentação',
-                    color=embed_color,
-                    footer_base=footer_base,
-                )
-            )
-
-        image_refs, context_image_refs, _ = _select_image_refs(urls, context_images)
-        return answer, embeds, sources, {
-            'user_message': current_message,
-            'trajectory': trajectory,
-            'image_urls': image_refs,
-            'context_image_urls': context_image_refs,
-        }
-
-    async def _store_conversation(
-        self,
-        message: discord.Message,
-        question: str,
-        answer: str,
-        sources: list[dict] | None = None,
-        spark_report: SparkReport | None = None,
-        interaction: discord.Interaction | None = None,
-        capture: dict | None = None,
-        participant_infos: list[dict] | None = None,
-    ) -> None:
-        """Persist a conversation exchange for follow-up replies."""
-        user = interaction.user if interaction is not None else None
-        guild = interaction.guild if interaction is not None else None
-        channel = interaction.channel if interaction is not None else message.channel
-        author = _author_info(user)
-        ts_dt = interaction.created_at if interaction is not None else message.created_at
-        ts = ts_dt.timestamp() if ts_dt else time.time()
-        turn = _make_turn(
-            question, answer,
-            author=author, ts=ts,
-            channel_id=getattr(channel, 'id', None),
-            channel_name=getattr(channel, 'name', None),
-            images=(capture or {}).get('image_urls', []),
-            sources=sources,
-            user_message=(capture or {}).get('user_message'),
-            trajectory=(capture or {}).get('trajectory'),
-            context_images=(capture or {}).get('context_image_urls'),
-        )
-        origin = {
-            'channel_id': str(getattr(channel, 'id', '') or ''),
-            'channel_name': getattr(channel, 'name', '') or '',
-            'guild_id': str(getattr(guild, 'id', '') or ''),
-            'guild_name': getattr(guild, 'name', '') or '',
-        }
-        participants = [author] if author.get('id') else []
-        _add_participants(participants, participant_infos or [])
-        await self.store.create(
-            str(message.id),
-            guild_id=origin['guild_id'] or None,
-            channel_id=origin['channel_id'] or None,
-            data={
-                'turns': [turn],
-                'participants': participants,
-                'origin': origin,
-                'started_ts': ts,
-            },
-        )
-        if spark_report is not None:
-            self._spark_by_conv[str(message.id)] = spark_report
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        """Handle reply-based follow-up conversations."""
-        if message.author.bot:
-            return
-        if not message.reference or not message.reference.message_id:
-            return
-
-        ref_id = message.reference.message_id
-        conv = await self.store.get_by_handle(ref_id)
-        if not conv:
-            return
-
-        # Enforce per-user cooldown on follow-up replies
-        user_id = message.author.id
-        if user_id in self._followup_cd:
-            try:
-                await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
-            except discord.HTTPException:
-                pass
-            return
-        self._followup_cd[user_id] = True
-
-        follow_up_question = message.content.strip()
-        if self.bot.user:
-            follow_up_question = strip_bot_mention(follow_up_question, self.bot.user, message.guild)
-            follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
-        if not follow_up_question and not message.attachments:
-            return
-
-        image_urls: list[str] = await _image_store.persist_images(
-            _message_media.visual_sources(message)
-        )
-        follow_up_question = _message_media.question_with_media(follow_up_question, message)
-
-        if not follow_up_question:
-            follow_up_question = 'Analise esta imagem.'
-
-        # Carry the Spark report forward through the conversation chain
-        # (in-memory only — lost on restart, text history survives).
-        spark_report: SparkReport | None = self._spark_by_conv.get(conv['conv_id'])
-
-        async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
-            try:
-                fresh = await self.store.get_by_handle(ref_id)
-                if fresh:
-                    conv = fresh
-                history = conv['data'].get('turns', []).copy()
-                participant_infos = await _message_participant_infos(message)
-                participant_ids = _conversation_participant_ids(
-                    conv['data'], participant_infos,
-                )
-                prior_context_result = await _fetch_turn_gap(message, history)
-                prior_context = prior_context_result.lines
-                prior_context_images = prior_context_result.images
-
-                answer, embeds, sources, capture = await self._run_agent(
-                    follow_up_question,
-                    history=history,
-                    image_urls=image_urls if image_urls else None,
-                    spark_report=spark_report,
-                    user=message.author,
-                    guild=message.guild,
-                    channel=message.channel,
-                    created_at=message.created_at,
-                    reply_to=str(ref_id),
-                    participant_ids=participant_ids,
-                    origin=message.jump_url,
-                    context_message=message,
-                    prior_context=prior_context,
-                    context_image_urls=prior_context_images,
-                )
-                if len(embeds) == 1:
-                    reply = await message.reply(embed=embeds[0])
-                else:
-                    reply = await message.reply(
-                        embed=embeds[0], view=PaginatedEmbedView(embeds)
-                    )
-
-                turn = _make_turn(
-                    follow_up_question, answer,
-                    author=_author_info(message.author),
-                    ts=message.created_at.timestamp(),
-                    message_id=message.id,
-                    channel_id=message.channel.id,
-                    channel_name=getattr(message.channel, 'name', None),
-                    images=capture.get('image_urls', image_urls),
-                    sources=sources,
-                    reply_to=ref_id,
-                    prior_context=prior_context,
-                    user_message=capture.get('user_message'),
-                    trajectory=capture.get('trajectory'),
-                    context_images=capture.get('context_image_urls'),
-                )
-                data = conv['data']
-                data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                _add_participants(data.setdefault('participants', []), participant_infos)
-                await self.store.update(
-                    conv['conv_id'], data, new_handle_msg_id=reply.id,
-                )
-                if spark_report is not None:
-                    self._spark_by_conv[conv['conv_id']] = spark_report
-            except RateLimitError:
-                await message.reply(
-                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
-                )
-            except Exception:
-                logger.exception("Error in follow-up reply")
-                await message.reply(
-                    'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
-                )
-
-    # --- Public Spark integration point ---
-
-    async def run_spark_analysis(
-        self,
-        interaction: discord.Interaction,
-        report: SparkReport,
-    ) -> None:
-        """Fetch a Spark report summary from the LLM and store the conversation.
-
-        Called by ``SparkAnalyzer`` after fetching and parsing the report.
-        The interaction must already be deferred (``defer(thinking=True)``)
-        before this is called.
-        """
-        server_tag = f'{report.platform_brand} {report.minecraft_version}'.strip()
-        embed_title = f'🔥 Spark — {server_tag}' if server_tag else '🔥 Relatório Spark'
-        question = (
-            'Analise este relatório Spark e identifique os principais problemas de '
-            'desempenho, se houver. Siga o protocolo diagnóstico.'
-        )
-        try:
-            answer, embeds, sources, capture = await self._run_agent(
-                question,
-                spark_report=report,
-                title=embed_title,
-                interaction=interaction,
-            )
-            # Clear any in-progress status message before sending the final embed.
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            if len(embeds) == 1:
-                msg = await interaction.followup.send(embed=embeds[0], wait=True)
-            else:
-                msg = await interaction.followup.send(
-                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
-                )
-            await self._store_conversation(
-                msg, question, answer,
-                sources=sources, spark_report=report, interaction=interaction,
-                capture=capture,
-            )
-
-        except RateLimitError:
-            await interaction.followup.send(
-                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
-            )
-        except Exception:
-            logger.exception("Error in Spark analysis")
-            await interaction.followup.send(
-                'Ocorreu um erro ao analisar o relatório. Tente novamente mais tarde.'
-            )
+        return '\n\n'.join(lines), []
 
     @app_commands.command(
         name='reindex',
@@ -1763,7 +805,7 @@ class DocsRAG(commands.Cog):
         )
 
 
+
+
 async def setup(bot: commands.Bot):
-    if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
-        logger.warning("OPENAI_API_KEY/OPENROUTER_API_KEY not set -- DocsRAG will use base_url %s with dummy key", OPENAI_BASE_URL)
     await bot.add_cog(DocsRAG(bot))

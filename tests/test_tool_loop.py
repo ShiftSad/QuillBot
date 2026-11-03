@@ -3,7 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
-from cogs.utils import run_tool_loop
+from core.tool_loop import run_tool_loop
 
 from helpers import as_stream, check
 

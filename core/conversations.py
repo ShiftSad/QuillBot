@@ -1,7 +1,9 @@
 """Persistent, attributed conversation store for multi-turn chats.
 
-Backs the reply-to-bot follow-up flows (``/chat`` + @mention in Commands, and
-``/ask``/Spark in DocsRAG) with SQLite so conversations survive restarts.
+Backs every conversation the bot has (``/chat``, ``/ask``, Spark, @mentions,
+replies, threads, monitors) with SQLite so conversations survive restarts.
+Which profile a conversation continues with is stored in its data
+(``data['profile']``).
 
 Design
 ------
@@ -14,6 +16,11 @@ Design
 - Activity-based TTL: conversations expire ``ttl_seconds`` after their **last
   activity** (read or write), not after creation, so active threads never die
   mid-conversation.
+- Every message that triggered a turn is a *trigger* (msg_id -> conv_id), so
+  deleting or editing it can find the answer it got.
+- With ``keep_expired`` an expired conversation stays (unreachable) until its
+  episode summary was written (:meth:`ConversationStore.expired_pending`,
+  :meth:`ConversationStore.mark_episode`) or ``EPISODE_GRACE_SECONDS`` pass.
 """
 
 from __future__ import annotations
@@ -27,9 +34,8 @@ import sqlite3
 import time
 from typing import Any
 
-from cogs import image_store
-from cogs.utils import BR_TZ
 from config import (
+    BR_TZ,
     CONVERSATIONS_GAP_MESSAGES,
     CONVERSATIONS_IMAGE_TURNS,
     CONVERSATIONS_TRAJECTORY_ENABLED,
@@ -38,10 +44,13 @@ from config import (
     CONVERSATIONS_TRAJECTORY_TURNS,
     LLM_CACHE_CONTROL,
 )
+from core import image_store
 
 logger = logging.getLogger(__name__)
 
 PRIOR_CONTEXT_HEADER = 'Mensagens no canal antes desta pergunta'
+# Expired conversations waiting for their episode summary are dropped after this.
+EPISODE_GRACE_SECONDS = 24 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +312,16 @@ def make_turn(
     user_message: dict | None = None,
     trajectory: list[dict] | None = None,
     context_images: list[str] | None = None,
+    message_ids: list[str | int] | None = None,
+    reply_ids: list[str | int] | None = None,
+    trigger_text: str | None = None,
 ) -> dict:
     """Build a single conversation turn record.
+
+    ``message_ids`` are all the messages answered in this turn (a burst),
+    ``message_id`` the last of them; ``reply_ids`` the bot messages that
+    carried the answer and ``trigger_text`` the raw text that was answered
+    (to tell a real edit from an embed unfurl).
 
     ``images`` are the user's own images; ``context_images`` are channel images
     that were inlined alongside them. They are stored apart so verbatim replay
@@ -314,7 +331,7 @@ def make_turn(
     (only its text is kept — images are re-inlined from their stored refs, so
     replay stays byte-identical without persisting base64 payloads).
     ``trajectory`` is the serialized internal loop (tool calls/results + final
-    answer) captured by :func:`cogs.utils.run_tool_loop`; replaying it verbatim
+    answer) captured by :func:`core.tool_loop.run_tool_loop`; replaying it verbatim
     lets follow-ups continue from the model's own prior steps.
 
     The persisted ``user_message`` is the exact text sent to the LLM (images
@@ -340,6 +357,13 @@ def make_turn(
     context_refs = [u for u in (context_images or []) if u][:image_store.MAX_IMAGES_PER_TURN]
     if context_refs:
         turn['context_images'] = context_refs
+    ids = [str(i) for i in (message_ids or []) if i]
+    if len(ids) > 1:
+        turn['message_ids'] = ids
+    if reply_ids:
+        turn['reply_ids'] = [str(i) for i in reply_ids if i]
+    if trigger_text is not None:
+        turn['trigger_text'] = trigger_text[:4000]
     captured_text = message_text(user_message)
     if captured_text:
         turn['user_message'] = captured_text
@@ -678,6 +702,9 @@ def build_current_message(
         context_inline, _ = _split_images(context_images)
         inline = current_inline + context_inline
         dropped += current_missing
+        if current_inline:
+            note = image_store.shown_image_note(len(current_inline))
+            text = f'{text}\n\n{note}' if text else note
         if context_inline:
             note = image_store.context_image_note(
                 len(context_inline), after_user_images=bool(current_inline),
@@ -735,25 +762,35 @@ def build_conversation_block(history: list[dict]) -> str:
 # SQLite-backed store
 # ---------------------------------------------------------------------------
 
+def turn_message_ids(turn: dict) -> list[str]:
+    """Every message answered in *turn* (all of a burst, or just ``message_id``)."""
+    ids = [str(i) for i in (turn.get('message_ids') or []) if i]
+    if not ids and turn.get('message_id'):
+        ids = [str(turn['message_id'])]
+    return ids
+
+
 class ConversationStore:
     """SQLite-backed conversation store with activity-based TTL.
 
-    Each instance serves one ``kind`` (e.g. ``'chat'`` or ``'ask'``) so multiple
-    cogs can share a database file without their message-id handles colliding.
+    ``kind`` namespaces rows in a shared database file (``'chat'`` for every
+    conversation the bot has now; older ``'ask'`` rows simply expire).
     """
 
     def __init__(
         self,
         db_path: str,
         *,
-        kind: str,
+        kind: str = 'chat',
         ttl_seconds: float = 1800.0,
         max_stored: int = 200,
+        keep_expired: bool = False,
     ):
         self.db_path = db_path
         self.kind = kind
         self.ttl_seconds = ttl_seconds
         self.max_stored = max_stored
+        self.keep_expired = keep_expired
         self._locks: dict[str, asyncio.Lock] = {}
         self._ensure_db()
 
@@ -784,6 +821,9 @@ class ConversationStore:
                 data TEXT NOT NULL,
                 PRIMARY KEY (kind, conv_id)
             )""")
+            columns = {r[1] for r in con.execute('PRAGMA table_info(conversations)')}
+            if 'episode_state' not in columns:
+                con.execute('ALTER TABLE conversations ADD COLUMN episode_state TEXT')
             con.execute(
                 'CREATE INDEX IF NOT EXISTS idx_conversations_active '
                 'ON conversations(kind, last_active_ts)'
@@ -799,66 +839,115 @@ class ConversationStore:
                 'CREATE INDEX IF NOT EXISTS idx_conv_handles_conv '
                 'ON conv_handles(kind, conv_id)'
             )
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS conv_triggers (
+                kind TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                PRIMARY KEY (kind, msg_id)
+            )""")
+            con.execute(
+                'CREATE INDEX IF NOT EXISTS idx_conv_triggers_conv '
+                'ON conv_triggers(kind, conv_id)'
+            )
             con.commit()
         finally:
             con.close()
 
     def _prune(self, con: sqlite3.Connection) -> None:
-        cutoff = time.time() - self.ttl_seconds
-        con.execute(
-            'DELETE FROM conversations WHERE kind=? AND last_active_ts < ?',
-            (self.kind, cutoff),
-        )
+        now = time.time()
+        cutoff = now - self.ttl_seconds
+        if self.keep_expired:
+            # Expired conversations wait for their episode summary (or the grace period).
+            con.execute(
+                'DELETE FROM conversations WHERE kind=? AND last_active_ts < ? '
+                'AND (episode_state IS NOT NULL OR last_active_ts < ?)',
+                (self.kind, cutoff, cutoff - EPISODE_GRACE_SECONDS),
+            )
+        else:
+            con.execute(
+                'DELETE FROM conversations WHERE kind=? AND last_active_ts < ?',
+                (self.kind, cutoff),
+            )
         con.execute(
             'DELETE FROM conversations WHERE kind=? AND conv_id NOT IN ('
             'SELECT conv_id FROM conversations WHERE kind=? '
             'ORDER BY last_active_ts DESC LIMIT ?)',
             (self.kind, self.kind, self.max_stored),
         )
-        con.execute(
-            'DELETE FROM conv_handles WHERE kind=? AND conv_id NOT IN '
-            '(SELECT conv_id FROM conversations WHERE kind=?)',
-            (self.kind, self.kind),
-        )
+        for table in ('conv_handles', 'conv_triggers'):
+            con.execute(
+                f'DELETE FROM {table} WHERE kind=? AND conv_id NOT IN '
+                '(SELECT conv_id FROM conversations WHERE kind=?)',
+                (self.kind, self.kind),
+            )
+
+    def _load(self, con: sqlite3.Connection, conv_id: str) -> dict | None:
+        row = con.execute(
+            'SELECT conv_id, data, last_active_ts, guild_id, channel_id FROM conversations '
+            'WHERE kind=? AND conv_id=?',
+            (self.kind, conv_id),
+        ).fetchone()
+        if row is None:
+            return None
+        cid, data_json, last_active, guild_id, channel_id = row
+        try:
+            data = json.loads(data_json)
+        except (json.JSONDecodeError, TypeError):
+            logger.exception('Corrupt conversation data for conv %s', cid)
+            return None
+        return {
+            'conv_id': cid, 'data': data, 'last_active_ts': last_active,
+            'guild_id': guild_id, 'channel_id': channel_id,
+            'expired': time.time() - last_active > self.ttl_seconds,
+        }
 
     def _get_by_handle(self, msg_id: str) -> dict | None:
         now = time.time()
         con = self._connect()
         try:
-            cur = con.execute(
-                'SELECT c.conv_id, c.data, c.last_active_ts FROM conv_handles h '
-                'JOIN conversations c ON c.kind = h.kind AND c.conv_id = h.conv_id '
-                'WHERE h.kind = ? AND h.msg_id = ?',
+            row = con.execute(
+                'SELECT conv_id FROM conv_handles WHERE kind = ? AND msg_id = ?',
                 (self.kind, str(msg_id)),
-            )
-            row = cur.fetchone()
+            ).fetchone()
             if row is None:
                 return None
-            conv_id, data_json, last_active = row
-            if now - last_active > self.ttl_seconds:
-                con.execute(
-                    'DELETE FROM conversations WHERE kind=? AND conv_id=?',
-                    (self.kind, conv_id),
-                )
-                con.execute(
-                    'DELETE FROM conv_handles WHERE kind=? AND conv_id=?',
-                    (self.kind, conv_id),
-                )
-                con.commit()
+            conv = self._load(con, row[0])
+            if conv is None:
+                return None
+            if conv['expired']:
+                if not self.keep_expired:
+                    self._delete(con, conv['conv_id'])
+                    con.commit()
                 return None
             con.execute(
                 'UPDATE conversations SET last_active_ts=? WHERE kind=? AND conv_id=?',
-                (now, self.kind, conv_id),
+                (now, self.kind, conv['conv_id']),
             )
             con.commit()
-            try:
-                data = json.loads(data_json)
-            except (json.JSONDecodeError, TypeError):
-                logger.exception('Corrupt conversation data for conv %s', conv_id)
-                return None
-            return {'conv_id': conv_id, 'data': data}
+            return {'conv_id': conv['conv_id'], 'data': conv['data']}
         finally:
             con.close()
+
+    def _get_by_trigger(self, msg_id: str) -> dict | None:
+        """The conversation a message triggered a turn of (expired ones too, flagged)."""
+        con = self._connect()
+        try:
+            row = con.execute(
+                'SELECT conv_id FROM conv_triggers WHERE kind=? AND msg_id=?',
+                (self.kind, str(msg_id)),
+            ).fetchone()
+            return self._load(con, row[0]) if row else None
+        finally:
+            con.close()
+
+    def _link(self, con: sqlite3.Connection, table: str, conv_id: str, ids: list[str] | None) -> None:
+        for mid in ids or []:
+            if mid:
+                con.execute(
+                    f'INSERT OR REPLACE INTO {table} (kind, msg_id, conv_id) VALUES (?,?,?)',
+                    (self.kind, str(mid), conv_id),
+                )
 
     def _create(
         self,
@@ -867,6 +956,8 @@ class ConversationStore:
         guild_id: str | None,
         channel_id: str | None,
         data: dict,
+        handle_ids: list[str] | None = None,
+        trigger_ids: list[str] | None = None,
     ) -> None:
         now = time.time()
         started = float(data.get('started_ts') or now)
@@ -874,17 +965,15 @@ class ConversationStore:
         try:
             con.execute(
                 'INSERT OR REPLACE INTO conversations '
-                '(conv_id, kind, guild_id, channel_id, started_ts, last_active_ts, data) '
-                'VALUES (?,?,?,?,?,?,?)',
+                '(conv_id, kind, guild_id, channel_id, started_ts, last_active_ts, data, episode_state) '
+                'VALUES (?,?,?,?,?,?,?,NULL)',
                 (
                     str(conv_id), self.kind, guild_id, channel_id,
                     started, now, json.dumps(data, ensure_ascii=False),
                 ),
             )
-            con.execute(
-                'INSERT OR REPLACE INTO conv_handles (kind, msg_id, conv_id) VALUES (?,?,?)',
-                (self.kind, str(conv_id), str(conv_id)),
-            )
+            self._link(con, 'conv_handles', str(conv_id), [str(conv_id), *(handle_ids or [])])
+            self._link(con, 'conv_triggers', str(conv_id), trigger_ids)
             self._prune(con)
             con.commit()
         finally:
@@ -895,7 +984,10 @@ class ConversationStore:
         conv_id: str,
         data: dict,
         *,
-        new_handle_msg_id: str | None,
+        handle_ids: list[str] | None = None,
+        trigger_ids: list[str] | None = None,
+        remove_ids: list[str] | None = None,
+        touch: bool = True,
     ) -> None:
         now = time.time()
         conv_id = str(conv_id)
@@ -918,18 +1010,39 @@ class ConversationStore:
                         started, now, json.dumps(data, ensure_ascii=False),
                     ),
                 )
-            else:
+            elif touch:
                 con.execute(
-                    'UPDATE conversations SET data=?, last_active_ts=? '
+                    'UPDATE conversations SET data=?, last_active_ts=?, episode_state=NULL '
                     'WHERE kind=? AND conv_id=?',
                     (json.dumps(data, ensure_ascii=False), now, self.kind, conv_id),
                 )
-            if new_handle_msg_id:
+            else:
                 con.execute(
-                    'INSERT OR REPLACE INTO conv_handles (kind, msg_id, conv_id) VALUES (?,?,?)',
-                    (self.kind, str(new_handle_msg_id), conv_id),
+                    'UPDATE conversations SET data=? WHERE kind=? AND conv_id=?',
+                    (json.dumps(data, ensure_ascii=False), self.kind, conv_id),
                 )
+            for mid in remove_ids or []:
+                for table in ('conv_handles', 'conv_triggers'):
+                    con.execute(
+                        f'DELETE FROM {table} WHERE kind=? AND msg_id=? AND conv_id=?',
+                        (self.kind, str(mid), conv_id),
+                    )
+            self._link(con, 'conv_handles', conv_id, handle_ids)
+            self._link(con, 'conv_triggers', conv_id, trigger_ids)
             self._prune(con)
+            con.commit()
+        finally:
+            con.close()
+
+    def _delete(self, con: sqlite3.Connection, conv_id: str) -> None:
+        con.execute('DELETE FROM conversations WHERE kind=? AND conv_id=?', (self.kind, conv_id))
+        for table in ('conv_handles', 'conv_triggers'):
+            con.execute(f'DELETE FROM {table} WHERE kind=? AND conv_id=?', (self.kind, conv_id))
+
+    def _delete_conv(self, conv_id: str) -> None:
+        con = self._connect()
+        try:
+            self._delete(con, str(conv_id))
             con.commit()
         finally:
             con.close()
@@ -943,6 +1056,31 @@ class ConversationStore:
                 (self.kind, cutoff),
             )
             return int(cur.fetchone()[0])
+        finally:
+            con.close()
+
+    def _expired_pending(self, limit: int) -> list[dict]:
+        cutoff = time.time() - self.ttl_seconds
+        con = self._connect()
+        try:
+            rows = con.execute(
+                'SELECT conv_id FROM conversations WHERE kind=? AND last_active_ts < ? '
+                'AND episode_state IS NULL ORDER BY last_active_ts LIMIT ?',
+                (self.kind, cutoff, limit),
+            ).fetchall()
+            return [c for c in (self._load(con, r[0]) for r in rows) if c is not None]
+        finally:
+            con.close()
+
+    def _mark_episode(self, conv_id: str, state: str) -> None:
+        con = self._connect()
+        try:
+            con.execute(
+                'UPDATE conversations SET episode_state=? WHERE kind=? AND conv_id=?',
+                (state, self.kind, str(conv_id)),
+            )
+            self._prune(con)
+            con.commit()
         finally:
             con.close()
 
@@ -963,8 +1101,12 @@ class ConversationStore:
         return lock
 
     async def get_by_handle(self, msg_id: str | int) -> dict | None:
-        """Look up a conversation by bot-reply message id (touches TTL)."""
+        """Look up a live conversation by bot-reply message id (touches TTL)."""
         return await asyncio.to_thread(self._get_by_handle, str(msg_id))
+
+    async def get_by_trigger(self, msg_id: str | int) -> dict | None:
+        """The conversation *msg_id* triggered a turn of, with ``expired`` set (no TTL touch)."""
+        return await asyncio.to_thread(self._get_by_trigger, str(msg_id))
 
     async def create(
         self,
@@ -973,10 +1115,14 @@ class ConversationStore:
         guild_id: str | None = None,
         channel_id: str | None = None,
         data: dict | None = None,
+        handle_ids: list | None = None,
+        trigger_ids: list | None = None,
     ) -> None:
         await asyncio.to_thread(
             self._create, str(conv_id),
             guild_id=guild_id, channel_id=channel_id, data=data or {},
+            handle_ids=[str(i) for i in handle_ids or [] if i],
+            trigger_ids=[str(i) for i in trigger_ids or [] if i],
         )
 
     async def update(
@@ -985,11 +1131,32 @@ class ConversationStore:
         data: dict,
         *,
         new_handle_msg_id: str | int | None = None,
+        handle_ids: list | None = None,
+        trigger_ids: list | None = None,
+        remove_ids: list | None = None,
+        touch: bool = True,
     ) -> None:
+        handles = [str(i) for i in handle_ids or [] if i]
+        if new_handle_msg_id:
+            handles.append(str(new_handle_msg_id))
         await asyncio.to_thread(
             self._update, str(conv_id), data,
-            new_handle_msg_id=str(new_handle_msg_id) if new_handle_msg_id else None,
+            handle_ids=handles,
+            trigger_ids=[str(i) for i in trigger_ids or [] if i],
+            remove_ids=[str(i) for i in remove_ids or [] if i],
+            touch=touch,
         )
+
+    async def delete(self, conv_id: str | int) -> None:
+        await asyncio.to_thread(self._delete_conv, str(conv_id))
 
     async def count_active(self) -> int:
         return await asyncio.to_thread(self._count_active)
+
+    async def expired_pending(self, limit: int = 10) -> list[dict]:
+        """Expired conversations still waiting for their episode summary (oldest first)."""
+        return await asyncio.to_thread(self._expired_pending, limit)
+
+    async def mark_episode(self, conv_id: str | int, state: str) -> None:
+        """Record that an expired conversation was summarized (``done``) or not worth it (``skipped``)."""
+        await asyncio.to_thread(self._mark_episode, str(conv_id), state)

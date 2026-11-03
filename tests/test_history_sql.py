@@ -202,34 +202,32 @@ async def test_sql_history_tool():
             wcon.close()
 
         # --- tool wiring (exec_history_tool)
-        import cogs.utils as utils_mod
-        from cogs import utils as U
-        class _FakeBot:
-            def __init__(self, cog): self._cog = cog
-            def get_cog(self, name): return self._cog if name == "HistoryRAG" else None
+        import cogs.history_rag as U
+        exec_history_tool = U.exec_history_tool
         class _FakeGuild:
             def __init__(self, id): self.id = id
-        fake_bot = _FakeBot(rag)
         q = f"SELECT author_full, COUNT(*) n FROM chunks WHERE guild_id={GID} GROUP BY author_full ORDER BY n DESC LIMIT 5"
-        text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": q}, bot=fake_bot, guild=_FakeGuild(GID), channel=None)
+        text = await exec_history_tool(rag, "sql_history", {"sql": q}, guild=_FakeGuild(GID))
         check("sql_history via tool layer", "Alice (@alice) | 4" in text, text[:200])
-        text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": f"DELETE FROM chunks WHERE guild_id={GID}"}, bot=fake_bot, guild=_FakeGuild(GID), channel=None)
+        text = await exec_history_tool(rag, "sql_history", {"sql": f"DELETE FROM chunks WHERE guild_id={GID}"}, guild=_FakeGuild(GID))
         check("write attempt rejected with guidance", "Consulta rejeitada" in text and "SELECT" in text, text)
-        text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": q}, bot=fake_bot, guild=None, channel=None)
+        text = await exec_history_tool(rag, "sql_history", {"sql": q}, guild=None)
         check("DM rejected", "servidor" in text, text)
-        text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": q}, bot=_FakeBot(None), guild=_FakeGuild(GID), channel=None)
+        text = await exec_history_tool(None, "sql_history", {"sql": q}, guild=_FakeGuild(GID))
         check("no cog rejected", text == "Histórico não disponível.", text)
-        text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": f"SELECT nosuchcol FROM chunks WHERE guild_id={GID}"}, bot=fake_bot, guild=_FakeGuild(GID), channel=None)
+        text = await exec_history_tool(rag, "sql_history", {"sql": f"SELECT nosuchcol FROM chunks WHERE guild_id={GID}"}, guild=_FakeGuild(GID))
         check("sqlite error surfaced", "Erro SQL" in text and "nosuchcol" in text.lower(), text[:200])
-        status = utils_mod.history_tool_status("sql_history", {"sql": "SELECT\n  COUNT(*)\nFROM chunks"})
+        status = U.history_tool_status("sql_history", {"sql": "SELECT\n  COUNT(*)\nFROM chunks"})
         check("status label flattens sql", status is not None and "\n" not in status, str(status))
         enabled = U.HISTORY_SQL_TOOL_ENABLED
         try:
             U.HISTORY_SQL_TOOL_ENABLED = False
-            text, _ = await utils_mod.exec_history_tool("sql_history", {"sql": q}, bot=fake_bot, guild=_FakeGuild(GID), channel=None)
+            text = await exec_history_tool(rag, "sql_history", {"sql": q}, guild=_FakeGuild(GID))
             check("disabled flag honored", "desativada" in text, text)
+            check("disabled tool not registered", "sql_history" not in [t.name for t in U.history_tools(rag)])
         finally:
             U.HISTORY_SQL_TOOL_ENABLED = enabled
         check("tool definition present", U.SQL_HISTORY_TOOL["function"]["name"] == "sql_history")
+        check("tool registered when enabled", "sql_history" in [t.name for t in U.history_tools(rag)])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

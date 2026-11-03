@@ -1,9 +1,9 @@
 """Monitors — standing triggers that call the bot on matching chat messages.
 
 A monitor watches the guild's messages and, when one matches its filters, runs
-the bot on that message the same way an @mention does: the same ``_run_chat``
-pipeline and toolset, the answer goes out as a reply, and replying to it
-continues the conversation.  The model is told the message reached it through
+the bot on that message the same way an @mention does: the same chat engine
+(``bot.services.chat.answer_monitor``) and toolset, the answer goes out as a
+reply, and replying to it continues the conversation.  The model is told the message reached it through
 a monitor (nobody called it) and may stay silent by answering
 ``NO_REPLY_TOKEN`` — nothing is posted then, though it can still act through
 its tools (react, write a memory, schedule something…).
@@ -16,8 +16,8 @@ Filters (all optional, combined with AND; at least one is required)
 - **regex**: the message content matches (``re.search``, case-insensitive)
 
 Messages from bots never trigger monitors, and neither do messages the bot
-already answers (an @mention of the bot, a reply to one of its conversations,
-anything posted in a chat thread the bot opened).
+already answers: the message router offers each message to the chat engine
+first, and monitors only see what it didn't take.
 When several monitors match one message they share a single run.  Each
 monitor has a cooldown so a busy channel can't turn into one LLM call per
 message.
@@ -42,10 +42,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.chat_threads import answers_unprompted
-from cogs.utils import BR_TZ, EMPTY_ANSWER_FALLBACK, PaginatedEmbedView
 from config import (
-    CHAT_MENTION_ENABLED,
+    BR_TZ,
     MONITORS_DB_PATH,
     MONITORS_DEFAULT_COOLDOWN,
     MONITORS_ENABLED,
@@ -53,11 +51,14 @@ from config import (
     MONITORS_MAX_PROMPT,
     MONITORS_MIN_COOLDOWN,
 )
+from core.tools import Tool
+from core.turn import NO_REPLY_TOKEN, is_silent
+from core.ui import PaginatedEmbedView
 
 logger = logging.getLogger(__name__)
 
-# What the model answers to stay silent on a monitor trigger.
-NO_REPLY_TOKEN = '[NO_REPLY]'
+ROUTER_NAME = 'monitors'
+__all__ = ['NO_REPLY_TOKEN', 'is_silent', 'Monitors', 'MonitorStore', 'monitor_matches', 'build_trigger_header']
 
 _MAX_NAME = 80
 _MAX_REGEX = 200
@@ -96,12 +97,6 @@ def can_manage(member) -> bool:
     """Whether *member* may create, edit or remove monitors (Manage Server or admin)."""
     perms = getattr(member, 'guild_permissions', None)
     return bool(perms and (perms.administrator or perms.manage_guild))
-
-
-def is_silent(answer: str | None) -> bool:
-    """Whether a monitor run's *answer* means "don't reply"."""
-    text = (answer or '').strip()
-    return not text or text == EMPTY_ANSWER_FALLBACK or 'NO_REPLY' in text.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +458,7 @@ class Monitors(commands.Cog, name='Monitors'):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.services = getattr(bot, 'services', None)
         self.store = MonitorStore(MONITORS_DB_PATH)
         # guild_id -> active monitors (with compiled regex), loaded lazily and
         # dropped on every write so on_message never touches SQLite per message.
@@ -472,6 +468,12 @@ class Monitors(commands.Cog, name='Monitors'):
 
     async def cog_load(self):
         await asyncio.to_thread(self.store.ensure)
+        self.services.router.handle(ROUTER_NAME, self.handle_message, priority=20)
+        self.services.tools.register(*monitor_tools(self))
+
+    async def cog_unload(self):
+        self.services.router.remove(ROUTER_NAME)
+        self.services.tools.unregister(*MONITOR_TOOL_NAMES)
 
     # --- Matching / firing ---
 
@@ -494,26 +496,6 @@ class Monitors(commands.Cog, name='Monitors'):
     def _invalidate(self, guild_id: int) -> None:
         self._cache.pop(guild_id, None)
 
-    async def _answered_elsewhere(self, message: discord.Message) -> bool:
-        """Whether the mention/reply handlers already answer *message*."""
-        if CHAT_MENTION_ENABLED and self.bot.user and (
-            self.bot.user.mentioned_in(message) or answers_unprompted(message, self.bot.user.id)
-        ):
-            return True
-        ref_id = message.reference.message_id if message.reference else None
-        if ref_id:
-            for cog_name in ('Commands', 'DocsRAG'):
-                cog = self.bot.get_cog(cog_name)
-                store = getattr(cog, 'store', None)
-                if store is None:
-                    continue
-                try:
-                    if await store.get_by_handle(ref_id):
-                        return True
-                except Exception:
-                    logger.exception('[monitors] conversation lookup failed in %s', cog_name)
-        return False
-
     async def matching(self, message: discord.Message) -> list[dict]:
         """Active monitors that fire on *message*, cooldowns applied and started."""
         if message.author.bot or message.guild is None:
@@ -522,7 +504,7 @@ class Monitors(commands.Cog, name='Monitors'):
         if not monitors:
             return []
         matched = [m for m in monitors if monitor_matches(m, message)]
-        if not matched or await self._answered_elsewhere(message):
+        if not matched:
             return []
         now = time.monotonic()
         due = [
@@ -533,30 +515,31 @@ class Monitors(commands.Cog, name='Monitors'):
             self._last_fired[m['id']] = now
         return due
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
+    async def handle_message(self, message: discord.Message) -> bool:
+        """Router handler (after the chat engine): run the monitors *message* matches."""
         try:
             due = await self.matching(message)
         except Exception:
             logger.exception('[monitors] matching failed for message %s', message.id)
-            return
+            return False
         if not due:
-            return
+            return False
         await asyncio.to_thread(self.store.mark_fired, message.guild.id, [m['id'] for m in due])
-        commands_cog = self.bot.get_cog('Commands')
-        if commands_cog is None or not commands_cog.client:
+        chat = self.services.chat
+        if chat is None or not self.services.llm.available:
             logger.warning('[monitors] chat unavailable; monitors %s not run', [m['id'] for m in due])
-            return
+            return True
         logger.info(
             '[monitors] firing %s on message=%s channel=%s author=%s',
             [m['id'] for m in due], message.id, message.channel.id, message.author.id,
         )
         try:
-            replied = await commands_cog.answer_monitor(message, build_trigger_header(due))
+            replied = await chat.answer_monitor(message, build_trigger_header(due))
             logger.info('[monitors] monitors %s %s', [m['id'] for m in due], 'replied' if replied else 'stayed silent')
         except Exception:
             # Nobody called the bot, so a failure stays in the logs.
             logger.exception('[monitors] run failed for monitors %s', [m['id'] for m in due])
+        return True
 
     # --- Core operations (shared by slash commands and tools) ---
 
@@ -934,6 +917,24 @@ MONITOR_DELETE_TOOL = {
 
 MONITOR_TOOLS = [MONITOR_CREATE_TOOL, MONITOR_LIST_TOOL, MONITOR_UPDATE_TOOL, MONITOR_DELETE_TOOL]
 MONITOR_TOOL_NAMES = {t['function']['name'] for t in MONITOR_TOOLS}
+
+
+def monitor_tools(cog: Monitors) -> list[Tool]:
+    """The monitor_* tools bound to *cog*; permissions are checked against who asked."""
+
+    async def run(ctx, args, *, name):
+        if ctx.guild is None:
+            return 'Monitores requerem estar em um servidor.'
+        return await cog.exec_tool(name, args, guild=ctx.guild, requester=ctx.user)
+
+    return [
+        Tool(
+            t['function']['name'], t,
+            lambda ctx, args, _n=t['function']['name']: run(ctx, args, name=_n),
+            lambda args, ctx, _n=t['function']['name']: monitor_tool_status(_n, args),
+        )
+        for t in MONITOR_TOOLS
+    ]
 
 
 def monitor_tool_status(name: str, args: dict) -> str:

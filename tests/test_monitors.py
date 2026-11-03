@@ -4,9 +4,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from cogs import commands as commands_mod
 from cogs import monitors as mon_mod
-from cogs.conversation_store import ConversationStore
 from cogs.monitors import (
     MonitorError,
     Monitors,
@@ -16,7 +14,7 @@ from cogs.monitors import (
     monitor_matches,
     normalize_fields,
 )
-from cogs.utils import EMPTY_ANSWER_FALLBACK
+from core.tool_loop import EMPTY_ANSWER_FALLBACK
 
 from helpers import check
 
@@ -118,6 +116,8 @@ def test_silence_detection():
     for answer in ('[NO_REPLY]', ' no_reply ', 'Nada a fazer. [NO_REPLY]', '', EMPTY_ANSWER_FALLBACK):
         check(f'silent: {answer!r}', is_silent(answer))
     check('a real answer is sent', not is_silent('Tenta reduzir o view-distance.'))
+    check('someone who asked hears about a failed answer', not is_silent(EMPTY_ANSWER_FALLBACK, unprompted=False))
+    check('but [NO_REPLY] is silent on any turn', is_silent('[NO_REPLY]', unprompted=False))
 
 
 def test_header_lists_monitors_and_the_way_out():
@@ -150,32 +150,23 @@ def test_store_roundtrip(tmp_path):
 
 # --- Cog ----------------------------------------------------------------------
 
-class FakeCommands:
-    def __init__(self, handles=()):
-        self.client = object()
+class FakeChat:
+    def __init__(self):
         self.calls = []
-        self.store = NS(get_by_handle=self._get)
-        self._handles = set(handles)
-
-    async def _get(self, mid):
-        return {'conv_id': str(mid)} if mid in self._handles else None
 
     async def answer_monitor(self, message, header):
         self.calls.append((message.id, header))
         return False
 
 
-def make_cog(tmp_path, commands_cog=None):
+def make_cog(tmp_path, chat=None):
     cog = Monitors.__new__(Monitors)
     cog.store = MonitorStore(str(tmp_path / 'monitors.db'))
     cog.store.ensure()
     cog._cache = {}
     cog._last_fired = {}
-    cogs = {'Commands': commands_cog or FakeCommands()}
-    cog.bot = NS(
-        user=NS(id=BOT_ID, mentioned_in=lambda m: any(u.id == BOT_ID for u in m.mentions)),
-        get_cog=cogs.get,
-    )
+    cog.services = NS(chat=chat or FakeChat(), llm=NS(available=True))
+    cog.bot = NS(user=NS(id=BOT_ID))
     return cog
 
 
@@ -203,93 +194,78 @@ async def test_bot_manages_monitors_through_tools(tmp_path):
 
 
 async def test_firing_combines_monitors_and_respects_cooldown(tmp_path):
-    commands_cog = FakeCommands()
+    commands_cog = FakeChat()
     cog = make_cog(tmp_path, commands_cog)
     g = FakeGuild()
     await cog.create(g, ADMIN, {'prompt': 'ajude com lag', 'regex': 'lag'})
     await cog.create(g, ADMIN, {'prompt': 'avise a staff', 'mentions': ['111'], 'cooldown_seconds': 3600})
     await cog.create(g, ADMIN, {'prompt': 'nunca', 'channels': [str(STAFF)]})
 
-    await cog.on_message(message('lag com <@111>', mentions=[111], mid=1))
+    await cog.handle_message(message('lag com <@111>', mentions=[111], mid=1))
     check('one run for both matching monitors', len(commands_cog.calls) == 1, commands_cog.calls)
     header = commands_cog.calls[0][1]
     check('header names both, not the third', 'Monitor #1' in header and 'Monitor #2' in header and 'Monitor #3' not in header, header)
     check('fire counts recorded', [m['fire_count'] for m in cog.store.list(1)] == [1, 1, 0])
 
-    await cog.on_message(message('lag de novo', mid=2))
+    await cog.handle_message(message('lag de novo', mid=2))
     check('cooldown holds the next message', len(commands_cog.calls) == 1, commands_cog.calls)
     cog._last_fired[1] -= 3600
-    await cog.on_message(message('lag de novo', mentions=[111], mid=3))
+    await cog.handle_message(message('lag de novo', mentions=[111], mid=3))
     check('after the cooldown only the cooled-down monitor fires', 'Monitor #1' in commands_cog.calls[-1][1] and 'Monitor #2' not in commands_cog.calls[-1][1], commands_cog.calls)
 
 
 async def test_messages_the_bot_already_answers_are_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(mon_mod, 'CHAT_MENTION_ENABLED', True)
-    commands_cog = FakeCommands(handles={77})
-    cog = make_cog(tmp_path, commands_cog)
+    """The router offers a message to the chat engine first; monitors only see the rest."""
+    from core.router import MessageRouter
+    chat = FakeChat()
+    cog = make_cog(tmp_path, chat)
     await cog.create(FakeGuild(), ADMIN, {'prompt': 'p', 'channels': [str(GENERAL)]})
-    await cog.on_message(message('bot talking', bot=True))
-    await cog.on_message(message(f'<@{BOT_ID}> oi', mentions=[BOT_ID]))
-    await cog.on_message(message('seguindo', reference=NS(message_id=77)))
-    check('bots, mentions and conversation replies never fire', commands_cog.calls == [], commands_cog.calls)
-    await cog.on_message(message('respondendo outra pessoa', reference=NS(message_id=78)))
-    check('a reply to anyone else still fires', len(commands_cog.calls) == 1, commands_cog.calls)
+    router = MessageRouter()
+
+    async def chat_handler(msg):
+        return msg.id in (2, 3)  # a mention and a reply to a conversation: the engine takes them
+
+    router.handle('chat', chat_handler, priority=10)
+    router.handle('monitors', cog.handle_message, priority=20)
+    check('bots never reach handlers', await router.dispatch(message('bot talking', bot=True, mid=1)) is None)
+    check('claimed by chat', await router.dispatch(message(f'<@{BOT_ID}> oi', mentions=[BOT_ID], mid=2)) == 'chat')
+    await router.dispatch(message('seguindo', reference=NS(message_id=77), mid=3))
+    check('mentions and conversation replies never fire', chat.calls == [], chat.calls)
+    check('anything else fires', await router.dispatch(message('respondendo outra pessoa', mid=4)) == 'monitors')
+    check('one run', len(chat.calls) == 1, chat.calls)
 
 
 async def test_paused_monitor_stops_firing(tmp_path):
-    commands_cog = FakeCommands()
+    commands_cog = FakeChat()
     cog = make_cog(tmp_path, commands_cog)
     g = FakeGuild()
     mon = await cog.create(g, ADMIN, {'prompt': 'p', 'regex': 'x'})
     await cog.update(g, ADMIN, mon['id'], {'status': 'paused'})
-    await cog.on_message(message('x'))
+    await cog.handle_message(message('x'))
     check('paused monitor is ignored', commands_cog.calls == [], commands_cog.calls)
 
 
-# --- Commands.answer_monitor --------------------------------------------------
+# --- ChatEngine.answer_monitor --------------------------------------------------
 
 async def _answer(tmp_path, monkeypatch, answer):
-    cog = commands_mod.Commands.__new__(commands_mod.Commands)
-    cog.store = ConversationStore(str(tmp_path / 'conv.db'), kind='chat')
-    runs, replies = [], []
-
-    async def fake_question(msg):
-        return 'o servidor ta com lag', [], ''
-
-    async def fake_run_chat(question, **kw):
-        runs.append((question, kw))
-        return answer, [commands_mod.discord.Embed(description=answer)], [], {}
-
-    async def no_participants(msg):
-        return []
-
-    cog._message_question = fake_question
-    cog._run_chat = fake_run_chat
-    monkeypatch.setattr(commands_mod, 'message_participant_infos', no_participants)
-
-    async def reply(**kw):
-        replies.append(kw)
-        return NS(id=9000)
-
-    msg = NS(
-        id=500, author=NS(id=222, display_name='John', name='john', bot=False), guild=None,
-        channel=NS(id=GENERAL, name='geral'), created_at=None, jump_url='https://discord.com/x', reply=reply,
-    )
-    sent = await cog.answer_monitor(msg, '[Monitor disparado — ninguém chamou você]')
-    return cog, sent, runs, replies
+    from chat_fakes import Guild, Message, TextChannel, make_engine
+    engine = make_engine(tmp_path, monkeypatch, answers=(answer,))
+    msg = Message(500, TextChannel(Guild()), 'o servidor ta com lag')
+    sent = await engine.answer_monitor(msg, '[Monitor disparado — ninguém chamou você]')
+    return engine, msg, sent
 
 
 async def test_answer_monitor_can_stay_silent(tmp_path, monkeypatch):
-    cog, sent, runs, replies = await _answer(tmp_path, monkeypatch, '[NO_REPLY]')
-    check('ran the chat pipeline on the message', runs and runs[0][1]['context_message'].id == 500, runs)
-    check('the model sees it came from a monitor', runs[0][0].startswith('[Monitor disparado'), runs[0][0])
-    check('nothing sent', not sent and replies == [], replies)
-    check('no conversation stored', await cog.store.get_by_handle(9000) is None)
+    engine, msg, sent = await _answer(tmp_path, monkeypatch, '[NO_REPLY]')
+    check('ran the chat pipeline on the message', engine.turns and engine.turns[0].message is msg, engine.turns)
+    check('the model sees it came from a monitor', engine.turns[0].question.startswith('[Monitor disparado'), engine.turns[0].question)
+    check('nothing sent', not sent and msg.replies == [], msg.replies)
+    check('no conversation stored', await engine.store.get_by_handle(501) is None)
 
 
 async def test_answer_monitor_replies_and_starts_a_conversation(tmp_path, monkeypatch):
-    cog, sent, runs, replies = await _answer(tmp_path, monkeypatch, 'Reduz o view-distance.')
-    check('reply sent without pinging the author', sent and replies and replies[0]['mention_author'] is False, replies)
-    conv = await cog.store.get_by_handle(9000)
+    engine, msg, sent = await _answer(tmp_path, monkeypatch, 'Reduz o view-distance.')
+    check('reply sent without pinging the author', sent and msg.replies and msg.replies[0]['mention_author'] is False, msg.replies)
+    conv = await engine.store.get_by_handle(501)
     check('reply is a conversation handle users can continue', conv is not None, conv)
     check('stored question keeps the monitor header', conv['data']['turns'][0]['question'].startswith('[Monitor'), conv)

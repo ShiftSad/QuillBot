@@ -285,32 +285,31 @@ async def test_history_search():
         con.close()
         check("authors purged with guild", users == [] and nchunks == 0, f"users={users} chunks={nchunks}")
 
-        # --- tool wiring (exec_history_tool)
-        import cogs.utils as utils_mod
-        class _FakeBot:
-            def __init__(self, cog): self._cog = cog
-            def get_cog(self, name): return self._cog if name == "HistoryRAG" else None
+        # --- tool wiring (exec_history_tool + the core get_message_context tool)
+        import core.context_tools as ctx_tools
+        from cogs.history_rag import exec_history_tool
+        from types import SimpleNamespace as _NS
         class _FakeGuild:
             id = GID
-        fake_bot = _FakeBot(rag)
-        text, _ = await utils_mod.exec_history_tool("find_user", {"query": "alice"}, bot=fake_bot, guild=_FakeGuild(), channel=None)
+        text = await exec_history_tool(rag, "find_user", {"query": "alice"}, guild=_FakeGuild())
         check("find_user via tool layer", "author_id=111" in text and "msgs" in text, text[:200])
-        text, _ = await utils_mod.exec_history_tool("find_user", {"query": "zed"}, bot=fake_bot, guild=_FakeGuild(), channel=None)
+        text = await exec_history_tool(rag, "find_user", {"query": "zed"}, guild=_FakeGuild())
         check("find_user no match hints fallback", "search_history" in text, text[:200])
-        text, _ = await utils_mod.exec_history_tool("find_user", {"query": "alice"}, bot=_FakeBot(None), guild=_FakeGuild(), channel=None)
+        text = await exec_history_tool(None, "find_user", {"query": "alice"}, guild=_FakeGuild())
         check("find_user no cog", text == "Histórico não disponível.", text)
-        text, _ = await utils_mod.exec_history_tool("find_user", {"query": "alice"}, bot=fake_bot, guild=None, channel=None)
+        text = await exec_history_tool(rag, "find_user", {"query": "alice"}, guild=None)
         check("find_user in DM", "servidor" in text, text)
-        orig_fetch = utils_mod.fetch_message_context
+        orig_fetch = ctx_tools.fetch_message_context
         async def _fake_fetch(*a, **k):
             return None
-        utils_mod.fetch_message_context = _fake_fetch  # type: ignore[assignment]
+        ctx_tools.fetch_message_context = _fake_fetch  # type: ignore[assignment]
         try:
-            text, _ = await utils_mod.exec_history_tool("get_message_context", {"message_id": "2", "channel_id": GENERAL}, bot=fake_bot, guild=_FakeGuild(), channel=None)
+            turn = _NS(bot=None, guild=_FakeGuild(), guild_id=GID, services=_NS(history=rag))
+            text = await ctx_tools._message_context(turn, {"message_id": "2", "channel_id": GENERAL})
             check("context falls back to index", text is not None and "Contexto ao redor" in text and "msg_id=2" in text, str(text)[:200])
-            text, _ = await utils_mod.exec_history_tool("get_message_context", {"message_id": "999", "channel_id": GENERAL, "window": None}, bot=fake_bot, guild=_FakeGuild(), channel=None)
+            text = await ctx_tools._message_context(turn, {"message_id": "999", "channel_id": GENERAL, "window": None})
             check("unknown message + null window no crash", "não encontrada" in text, str(text)[:200])
         finally:
-            utils_mod.fetch_message_context = orig_fetch  # type: ignore[assignment]
+            ctx_tools.fetch_message_context = orig_fetch  # type: ignore[assignment]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

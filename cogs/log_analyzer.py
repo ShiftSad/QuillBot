@@ -5,22 +5,24 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from openai import AsyncOpenAI, RateLimitError
+from openai import RateLimitError
 
-from cogs import image_store
-from cogs.utils import PaginatedEmbedView, _usage_summary, create_chat_completion, split_response
+from core import image_store
+from core.discord_text import split_response
+from core.llm import usage_summary as _usage_summary
+from core.ui import PaginatedEmbedView
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
     COOLDOWN_RATE,
     MAX_CONTENT_SIZE,
     MAX_LOG_CONTEXT,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
 )
 from responses.errors import patterns
 
 logger = logging.getLogger(__name__)
+
+OBSERVER_NAME = 'log-links'
 
 MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/(\w+)')
 PASTEBIN_PATTERN = re.compile(r'https://pastebin\.com/(\w+)')
@@ -141,7 +143,7 @@ class AnalyzeView(discord.ui.View):
                 'Esta análise já foi solicitada.', ephemeral=True
             )
             return
-        if not self.analyzer.ai_client:
+        if not self.analyzer.ai_available:
             await interaction.response.send_message(
                 '⚠️ IA não disponível: chave de API não configurada.', ephemeral=True
             )
@@ -196,25 +198,20 @@ class LogAnalyzer(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: aiohttp.ClientSession | None = None
-        self.ai_client: AsyncOpenAI | None = None
-        api_key = OPENAI_API_KEY or "not-needed"
-        try:
-            self.ai_client = AsyncOpenAI(
-                base_url=OPENAI_BASE_URL,
-                api_key=api_key,
-            )
-            if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
-                logger.warning("OPENAI_API_KEY not set -- log analysis will fail until configured")
-        except Exception:
-            logger.exception("Failed to initialize OpenAI client for LogAnalyzer")
-            self.ai_client = None
+        self.services = bot.services
+
+    @property
+    def ai_available(self) -> bool:
+        return self.services.llm.available
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
         )
+        self.services.router.observe(OBSERVER_NAME, self.detect_logs)
 
     async def cog_unload(self):
+        self.services.router.remove(OBSERVER_NAME)
         if self.session:
             await self.session.close()
 
@@ -280,11 +277,12 @@ class LogAnalyzer(commands.Cog):
             logger.exception("Failed to upload to mclo.gs")
         return None
 
-    # --- Passive message listener ---
+    # --- Passive detection (router observer) ---
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
+    async def detect_logs(self, message: discord.Message):
         if message.author.bot:
+            return
+        if not self.services.settings.get(getattr(message.guild, 'id', None), message.channel, 'log_detection'):
             return
 
         has_attachments = bool(message.attachments)
@@ -332,7 +330,7 @@ class LogAnalyzer(commands.Cog):
                         )
                         ai_view = (
                             AnalyzeView(self, raw_url, mclogs_url)
-                            if not response and self.ai_client else None
+                            if not response and self.ai_available else None
                         )
                         if mclogs_url:
                             await message.reply(
@@ -349,7 +347,7 @@ class LogAnalyzer(commands.Cog):
                             break
 
         # For paste links with no regex match, offer AI analysis as a follow-up prompt
-        if fetch_url and link_content and not response and self.ai_client:
+        if fetch_url and link_content and not response and self.ai_available:
             await message.reply(
                 '🤔 Não reconheci nenhum erro específico no log. Deseja uma análise com IA?',
                 view=AnalyzeView(self, fetch_url, mclogs_url),
@@ -362,7 +360,7 @@ class LogAnalyzer(commands.Cog):
 
     async def _analyze_with_ai(self, log_content: str | None = None, image_ref: str | None = None) -> str | None:
         """Send log content and/or image to the LLM for analysis."""
-        if not self.ai_client:
+        if not self.ai_available:
             return None
 
         messages = [{'role': 'system', 'content': ANALYZE_SYSTEM_PROMPT}]
@@ -391,8 +389,7 @@ class LogAnalyzer(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': user_parts[0]['text']})
 
-        response = await create_chat_completion(
-            self.ai_client,
+        response = await self.services.llm.complete(
             model=CHAT_MODEL,
             messages=messages,
             max_tokens=1500,
@@ -414,7 +411,7 @@ class LogAnalyzer(commands.Cog):
         log_file: discord.Attachment | None = None,
         image: discord.Attachment | None = None,
     ):
-        if not self.ai_client:
+        if not self.ai_available:
             await interaction.response.send_message(
                 '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
             )
@@ -454,7 +451,7 @@ class LogAnalyzer(commands.Cog):
         )
 
         if image:
-            image_url = await image_store.persist_attachment(image)
+            image_url = (await image_store.persist_shown([image]) or [None])[0]
 
         log_content = None
         content_truncated = False

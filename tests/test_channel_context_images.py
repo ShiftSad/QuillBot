@@ -4,9 +4,9 @@ import asyncio
 import datetime
 from types import SimpleNamespace
 
-from cogs import conversation_store as cs
-from cogs import utils
-from cogs.conversation_store import build_current_message
+from core import conversations as cs
+from core import context as utils
+from core.conversations import build_current_message
 
 
 class FakeChannel:
@@ -224,7 +224,7 @@ def test_attachment_download_is_reused():
             reads.append(1)
             return b'bytes'
 
-    async def persist(data):
+    async def persist(data, **kw):
         ref = 'img:stored.jpg'
         with open(store.image_path(ref), 'wb') as f:
             f.write(data)

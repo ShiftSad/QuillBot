@@ -11,8 +11,8 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 
-from cogs import conversation_store as cs
-from cogs.conversation_store import (
+from core import conversations as cs
+from core.conversations import (
     ConversationStore,
     apply_cache_control,
     build_history_messages,
@@ -21,7 +21,8 @@ from cogs.conversation_store import (
     stepped_floor,
     validate_trajectory,
 )
-from cogs.utils import SQL_HISTORY_TOOL, extract_text_tool_calls, run_tool_loop, serialize_trajectory
+from cogs.history_rag import SQL_HISTORY_TOOL
+from core.tool_loop import extract_text_tool_calls, run_tool_loop, serialize_trajectory
 
 from helpers import as_stream, check
 

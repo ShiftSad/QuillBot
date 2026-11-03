@@ -20,13 +20,15 @@ logger = logging.getLogger('quillbot')
 # tavily) is constructed.
 install_api_logging()
 
+from core.services import Services  # noqa: E402  (after the transport patch: builds the LLM client)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 # Nothing in message content pings by default: several replies echo user or
 # LLM text, which could otherwise smuggle in @everyone / role / user pings.
-# Code paths that should notify opt in per message (see ping_send_kwargs).
+# Code paths that should notify opt in per message (see core.delivery).
 # replied_user stays on so replies keep notifying their author.
 bot = commands.Bot(
     command_prefix='!',
@@ -35,11 +37,30 @@ bot = commands.Bot(
         everyone=False, users=False, roles=False, replied_user=True,
     ),
 )
+# Shared services (LLM client, tool registry, message router, settings,
+# conversations, chat engine) — how the cogs reach each other.
+bot.services = Services()
+bot.services.settings.load()
 
-# Load order matters: log_analyzer's on_message (pattern matching) runs before
-# docs_rag's on_message (follow-up replies). Do not reorder without reviewing
-# listener interactions.
-COGS = ['cogs.log_analyzer', 'cogs.history_rag', 'cogs.commands', 'cogs.plugins', 'cogs.spark', 'cogs.docs_rag', 'cogs.memory', 'cogs.scheduler', 'cogs.monitors', 'cogs.summary']
+# Load order doesn't matter: messages go through bot.services.router, which
+# runs passive observers and offers each message to the chat engine before
+# monitors, whatever order the cogs registered in.
+COGS = [
+    'cogs.chat',
+    'cogs.commands',
+    'cogs.server_config',
+    'cogs.history_rag',
+    'cogs.docs_rag',
+    'cogs.memory',
+    'cogs.persona',
+    'cogs.log_analyzer',
+    'cogs.plugins',
+    'cogs.spark',
+    'cogs.scheduler',
+    'cogs.monitors',
+    'cogs.summary',
+    'cogs.wrapped',
+]
 
 
 @bot.tree.error
@@ -65,6 +86,12 @@ async def on_ready():
     logger.info('Logged on as %s', bot.user)
     synced = await bot.tree.sync()
     logger.info('Synced %d slash command(s) with Discord', len(synced))
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # The bot has no prefix commands; every message goes through the router.
+    await bot.services.router.dispatch(message)
 
 
 async def main():

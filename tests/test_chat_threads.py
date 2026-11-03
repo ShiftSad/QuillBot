@@ -1,183 +1,22 @@
 """Chat threads: long or off-topic conversations move out of the channel."""
 
-import datetime
 from types import SimpleNamespace as NS
 
 import discord
 
-from cogs import chat_threads
-from cogs import commands as commands_mod
-from cogs import monitors as mon_mod
-from cogs.conversation_store import ConversationStore
-from cogs.utils import ChannelContext
+from core import chat_threads
+from core.context_tools import register as register_core_tools
+from core.profiles import CHAT
+from core.runner import run_turn
+from core.turn import TurnContext
+import core.runner as runner_mod
 
+from chat_fakes import (
+    ASKER, BOT_ID, Guild, Message, TextChannel, Thread, make_engine, make_services, reply_to, seed,
+)
 from helpers import as_stream, check
 
-BOT_ID = 900
-ASKER = NS(id=222, name='john', display_name='John', bot=False, mention='<@222>')
 FIRST_QUESTION = 'como reduzo o lag do servidor?'
-
-
-class NoTyping:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-def history_of(messages):
-    def history(*, limit, before=None):
-        async def gen():
-            for m in messages[:limit]:
-                yield m
-        return gen()
-    return history
-
-
-class Guild:
-    def __init__(self):
-        self.id = 1
-        self.name = 'Miners'
-        self.me = NS(id=BOT_ID, display_name='QuillBot')
-        self.threads = {}
-
-    def get_thread(self, tid):
-        return self.threads.get(tid)
-
-    def get_channel(self, cid):
-        return None
-
-    async def fetch_channel(self, cid):
-        raise discord.NotFound(NS(status=404, reason='Not Found'), 'Unknown Channel')
-
-
-class TextChannel(discord.TextChannel):
-    """A text channel that passes isinstance checks without a gateway."""
-
-    def __init__(self, guild, *, cid=10, can_thread=True):
-        self.id = cid
-        self.name = 'geral'
-        self.guild = guild
-        self.can_thread = can_thread
-        self.messages = []
-
-    def permissions_for(self, member):
-        return discord.Permissions(
-            create_public_threads=self.can_thread, send_messages_in_threads=self.can_thread,
-        )
-
-    def history(self, *, limit, before=None):
-        return history_of(self.messages)(limit=limit, before=before)
-
-    def typing(self):
-        return NoTyping()
-
-
-class Thread(discord.Thread):
-    def __init__(self, guild, *, tid=700, owner_id=BOT_ID, name='thread', archived=False):
-        self.id = tid
-        self.name = name
-        self.guild = guild
-        self.owner_id = owner_id
-        self.parent_id = 10
-        self.archived = archived
-        self.locked = False
-        self.sent = []
-        self.messages = []
-        guild.threads[tid] = self
-
-    async def send(self, **kwargs):
-        self.sent.append(kwargs)
-        return NS(id=self.id + len(self.sent))
-
-    async def edit(self, **kwargs):
-        self.archived = kwargs.get('archived', self.archived)
-        return self
-
-    def history(self, *, limit, before=None):
-        return history_of(self.messages)(limit=limit, before=before)
-
-    def typing(self):
-        return NoTyping()
-
-
-class Message:
-    def __init__(self, mid, channel, content='', *, mtype=discord.MessageType.default):
-        self.id = mid
-        self.channel = channel
-        self.guild = channel.guild
-        self.author = ASKER
-        self.content = content
-        self.type = mtype
-        self.reference = None
-        self.attachments = []
-        self.embeds = []
-        self.stickers = []
-        self.mentions = []
-        self.created_at = datetime.datetime(2026, 10, 28, 12, 0, tzinfo=datetime.timezone.utc)
-        self.jump_url = f'https://discord.com/channels/1/{channel.id}/{mid}'
-        self.replies = []
-        self.opened = []
-
-    async def reply(self, *args, **kwargs):
-        self.replies.append(kwargs)
-        return NS(id=self.id + 1)
-
-    async def create_thread(self, *, name, auto_archive_duration):
-        self.opened.append((name, auto_archive_duration))
-        return Thread(self.guild, tid=self.id + 100, name=name)
-
-
-def make_cog(tmp_path, monkeypatch, *, answer='Reduz o view-distance.', thread_title=None):
-    cog = commands_mod.Commands.__new__(commands_mod.Commands)
-    bot_user = NS(id=BOT_ID, display_name='QuillBot', mentioned_in=lambda m: f'<@{BOT_ID}>' in m.content)
-    cog.bot = NS(user=bot_user, get_cog=lambda name: None)
-    cog.store = ConversationStore(str(tmp_path / 'conv.db'), kind='chat')
-    cog.client = object()
-    cog._followup_cd = {}
-    cog.runs = []
-
-    async def fake_run_chat(question, **kw):
-        cog.runs.append((question, kw))
-        return answer, [discord.Embed(description=answer)], [], {'thread_title': thread_title}
-
-    async def no_participants(msg):
-        return []
-
-    async def no_gap(message, history):
-        return ChannelContext()
-
-    async def no_images(urls):
-        return []
-
-    cog._run_chat = fake_run_chat
-    monkeypatch.setattr(commands_mod, 'message_participant_infos', no_participants)
-    monkeypatch.setattr(commands_mod, 'fetch_turn_gap', no_gap)
-    monkeypatch.setattr(commands_mod.image_store, 'persist_images', no_images)
-    monkeypatch.setattr(commands_mod, 'CHAT_MENTION_ENABLED', True)
-    monkeypatch.setattr(commands_mod, 'CHAT_MENTION_CONTINUE_ENABLED', True)
-    monkeypatch.setattr(commands_mod, 'CHANNEL_CONTEXT_MESSAGES', 10)
-    monkeypatch.setattr(chat_threads, 'CHAT_THREADS_ENABLED', True)
-    monkeypatch.setattr(chat_threads, 'CHAT_THREAD_AFTER_TURNS', 3)
-    monkeypatch.setattr(chat_threads, 'CHAT_THREAD_CHANNELS', frozenset())
-    return cog
-
-
-async def seed(cog, turns, *, handle=60, thread_id=None):
-    """A stored conversation of *turns* turns, continued through bot message *handle*."""
-    data = {
-        'turns': [
-            {'question': FIRST_QUESTION if i == 0 else f'q{i}', 'answer': f'a{i}',
-             'message_id': str(50 + i), 'channel_id': '10', 'author': {'id': '222'}}
-            for i in range(turns)
-        ],
-        'participants': [],
-    }
-    if thread_id:
-        data['thread_id'] = str(thread_id)
-    await cog.store.create(handle, channel_id='10', data=data)
-    return await cog.store.get_by_handle(handle)
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -206,16 +45,16 @@ def test_thread_due_on_long_conversations_and_listed_channels(monkeypatch):
 
 
 def test_thread_request_only_records_when_available():
-    req = chat_threads.ThreadRequest(True)
+    req = chat_threads.ThreadRequest(None)
     result = req({'title': 'Receita de **bolo**'})
     check('title recorded without markup', req.title == 'Receita de bolo', req.title)
     check('model told its answer goes there', 'Receita de bolo' in result, result)
-    req = chat_threads.ThreadRequest(True)
+    req = chat_threads.ThreadRequest(None)
     req({'title': '  '})
     check('an empty title is refused', req.title is None)
-    req = chat_threads.ThreadRequest(False)
+    req = chat_threads.ThreadRequest('a conversa já está numa thread')
     result = req({'title': 'x'})
-    check('unavailable here', req.title is None and 'Não dá' in result, result)
+    check('unavailable here, with the reason', req.title is None and 'numa thread' in result, result)
 
 
 def test_can_open_thread_needs_a_text_channel_and_permissions(monkeypatch):
@@ -225,6 +64,22 @@ def test_can_open_thread_needs_a_text_channel_and_permissions(monkeypatch):
     check('no thread permissions', not chat_threads.can_open_thread(TextChannel(guild, can_thread=False)))
     check('threads answer in place', not chat_threads.can_open_thread(Thread(guild)))
     check('DMs and the like answer in place', not chat_threads.can_open_thread(NS(id=5)))
+
+
+def test_thread_blocker_names_the_missing_permission(monkeypatch, caplog):
+    monkeypatch.setattr(chat_threads, 'CHAT_THREADS_ENABLED', True)
+    monkeypatch.setattr(chat_threads, '_warned_channels', set())
+    guild = Guild()
+    check('nothing blocks a channel with both permissions', chat_threads.thread_blocker(TextChannel(guild)) is None)
+    reason = chat_threads.thread_blocker(TextChannel(guild, missing={'send_messages_in_threads'}))
+    check('names the missing permission', 'Enviar mensagens em threads' in reason, reason)
+    check('only the missing one', 'Criar threads públicas' not in reason, reason)
+    check('a thread says so', 'numa thread' in chat_threads.thread_blocker(Thread(guild)))
+    check('other channels say so', 'tipo de canal' in chat_threads.thread_blocker(NS(id=5)))
+    chat_threads.thread_blocker(TextChannel(guild, missing={'send_messages_in_threads'}))
+    warnings = [r for r in caplog.records if 'cannot open threads' in r.getMessage()]
+    check('logged once per channel', len(warnings) == 1, [r.getMessage() for r in warnings])
+    check('the log names the flag', 'send_messages_in_threads' in warnings[0].getMessage(), warnings[0].getMessage())
 
 
 def test_answers_unprompted_only_in_the_bot_threads(monkeypatch):
@@ -242,162 +97,172 @@ def test_answers_unprompted_only_in_the_bot_threads(monkeypatch):
 # --- Moving a conversation ----------------------------------------------------
 
 async def test_second_follow_up_moves_the_conversation_to_a_thread(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
     channel = TextChannel(guild)
-    conv = await seed(cog, 1)
+    await seed(engine, 1)
 
-    first = Message(80, channel, 'e o simulation-distance?')
-    await cog._continue_conversation(first, 60, conv, reply_to=60)
+    first = Message(80, channel, 'e o simulation-distance?', reference=reply_to(60))
+    await engine.handle_message(first)
     check('turn 2 replies in the channel', len(first.replies) == 1 and first.opened == [], first.opened)
-    check('the model may still open one itself', cog.runs[-1][1]['thread_available'] is True)
+    check('the model may still open one itself', engine.turns[-1].thread_blocker is None)
+    check('plain message, not an embed', 'content' in first.replies[0] and 'embed' not in first.replies[0], first.replies)
 
-    cog._followup_cd.clear()
-    conv = await cog.store.get_by_handle(81)
-    second = Message(90, channel, 'e o view-distance?')
-    await cog._continue_conversation(second, 81, conv, reply_to=81)
+    second = Message(90, channel, 'e o view-distance?', reference=reply_to(81))
+    await engine.handle_message(second)
     check('turn 3 opens a thread on the asker message, named after the first question',
           second.opened == [(FIRST_QUESTION, chat_threads.ARCHIVE_MINUTES)], second.opened)
     thread = guild.threads[190]
     check('answer posted in the thread, pinging the asker',
-          len(thread.sent) == 1 and thread.sent[0]['content'] == '<@222>', thread.sent)
+          len(thread.sent) == 1 and thread.sent[0]['content'].startswith('<@222> Reduz'), thread.sent)
     check('nothing left in the channel', second.replies == [], second.replies)
-    moved = await cog.store.get_by_handle(191)
+    moved = await engine.store.get_by_handle(191)
     check('the thread message continues the conversation', moved and moved['conv_id'] == '60', moved)
     check('the conversation remembers its thread', moved['data']['thread_id'] == '190', moved['data'])
     check('all turns kept', len(moved['data']['turns']) == 3, moved['data']['turns'])
 
 
 async def test_moved_conversation_answers_in_its_thread_from_the_channel(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
     thread = Thread(guild, tid=700, archived=True)
-    conv = await seed(cog, 3, thread_id=700)
-    msg = Message(80, TextChannel(guild), 'mais uma coisa')
-    await cog._continue_conversation(msg, 60, conv, reply_to=60)
+    await seed(engine, 3, thread_id=700)
+    msg = Message(80, TextChannel(guild), 'mais uma coisa', reference=reply_to(60))
+    await engine.handle_message(msg)
     check('no second thread', msg.opened == [], msg.opened)
-    check('no new thread offered to the model', cog.runs[0][1]['thread_available'] is False)
+    check('the model is told the conversation has one', engine.turns[0].thread_blocker == chat_threads.HAS_THREAD)
     check('archived thread revived and used', not thread.archived and len(thread.sent) == 1, thread.sent)
     check('nothing in the channel', msg.replies == [])
 
 
 async def test_vanished_thread_opens_a_new_one(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
-    conv = await seed(cog, 3, thread_id=999)
-    msg = Message(80, TextChannel(guild), 'voltei')
-    await cog._continue_conversation(msg, 60, conv, reply_to=60)
+    await seed(engine, 3, thread_id=999)
+    msg = Message(80, TextChannel(guild), 'voltei', reference=reply_to(60))
+    await engine.handle_message(msg)
     check('a long conversation whose thread is gone gets a new one', len(msg.opened) == 1, msg.opened)
-    stored = await cog.store.get_by_handle(181)
+    stored = await engine.store.get_by_handle(181)
     check('and points to it', stored['data']['thread_id'] == '180', stored['data'])
 
 
 async def test_quick_mention_answers_in_place(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     channel = TextChannel(Guild())
     msg = Message(80, channel, f'<@{BOT_ID}> qual a versão do paper?')
-    await cog.on_message(msg)
-    check('the tool is offered', cog.runs[0][1]['thread_available'] is True)
+    await engine.handle_message(msg)
+    check('the tool is offered', engine.turns[0].thread_blocker is None)
     check('first answer replies in the channel', len(msg.replies) == 1 and msg.opened == [], msg.opened)
-    conv = await cog.store.get_by_handle(81)
+    check('a mention reply does not ping the asker', msg.replies[0].get('mention_author') is False, msg.replies)
+    conv = await engine.store.get_by_handle(81)
     check('no thread stored', conv and 'thread_id' not in conv['data'], conv)
+    check('the trigger maps to the conversation', (await engine.store.get_by_trigger(80))['conv_id'] == '81')
 
 
 async def test_model_moves_an_off_topic_mention_to_a_thread(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch, thread_title='Receita de bolo')
+    engine = make_engine(tmp_path, monkeypatch, thread_title='Receita de bolo')
     guild = Guild()
     msg = Message(80, TextChannel(guild), f'<@{BOT_ID}> me passa uma receita de bolo')
-    await cog.on_message(msg)
+    await engine.handle_message(msg)
     check('thread named by the model', msg.opened == [('Receita de bolo', chat_threads.ARCHIVE_MINUTES)], msg.opened)
     check('answer in the thread', len(guild.threads[180].sent) == 1 and msg.replies == [])
-    conv = await cog.store.get_by_handle(181)
+    conv = await engine.store.get_by_handle(181)
     check('the conversation starts in the thread', conv and conv['data']['thread_id'] == '180', conv)
 
 
 async def test_listed_channels_always_use_threads(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     monkeypatch.setattr(chat_threads, 'CHAT_THREAD_CHANNELS', frozenset({10}))
+    import core.settings as settings_mod
+    monkeypatch.setattr(settings_mod, 'CHAT_THREAD_CHANNELS', frozenset({10}))
     msg = Message(80, TextChannel(Guild()), f'<@{BOT_ID}> me passa uma receita de bolo')
-    await cog.on_message(msg)
+    await engine.handle_message(msg)
     check('thread named after the question, without the mention',
           msg.opened == [('me passa uma receita de bolo', chat_threads.ARCHIVE_MINUTES)], msg.opened)
 
 
+async def test_threads_setting_per_channel(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    engine.services.settings.write(1, 10, 'threads', 'always')
+    msg = Message(80, TextChannel(Guild()), f'<@{BOT_ID}> oi')
+    await engine.handle_message(msg)
+    check('"always" opens a thread on the first answer', len(msg.opened) == 1, msg.opened)
+
+    engine.services.settings.write(1, 10, 'threads', 'never')
+    await seed(engine, 5, handle=600)
+    msg = Message(90, TextChannel(Guild()), 'mais', reference=reply_to(600))
+    await engine.handle_message(msg)
+    check('"never" keeps even long conversations in the channel', msg.opened == [] and len(msg.replies) == 1, msg.opened)
+    check('and the model is told why', 'configuração do servidor' in engine.turns[-1].thread_blocker, engine.turns[-1].thread_blocker)
+
+
 async def test_channel_without_thread_permission_answers_in_place(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
-    monkeypatch.setattr(chat_threads, 'CHAT_THREAD_CHANNELS', frozenset({10}))
+    engine = make_engine(tmp_path, monkeypatch)
+    engine.services.settings.write(1, 10, 'threads', 'always')
     msg = Message(80, TextChannel(Guild(), can_thread=False), f'<@{BOT_ID}> oi')
-    await cog.on_message(msg)
-    check('tool not offered', cog.runs[0][1]['thread_available'] is False)
+    await engine.handle_message(msg)
+    check('the model is told the permission is missing', 'Criar threads públicas' in engine.turns[0].thread_blocker)
     check('reply in place', len(msg.replies) == 1 and msg.opened == [], msg.opened)
 
 
 # --- Inside the bot's thread --------------------------------------------------
 
 async def test_message_in_bot_thread_continues_without_a_mention(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
     thread = Thread(guild, tid=700)
     thread.messages = [NS(id=60, author=NS(id=BOT_ID))]
-    await seed(cog, 3, thread_id=700)
+    await seed(engine, 3, thread_id=700)
     msg = Message(80, thread, 'e o view-distance?')
-    await cog.on_message(msg)
+    await engine.handle_message(msg)
     check('the model is told nobody mentioned it',
-          cog.runs and cog.runs[0][0].startswith(chat_threads.UNPROMPTED_HEADER), cog.runs)
+          engine.turns and engine.turns[0].question.startswith(chat_threads.UNPROMPTED_HEADER), engine.turns)
     check('answered right there', len(msg.replies) == 1 and msg.opened == [] and thread.sent == [])
-    conv = await cog.store.get_by_handle(81)
+    conv = await engine.store.get_by_handle(81)
     check('same conversation, one more turn', conv and len(conv['data']['turns']) == 4, conv)
 
 
 async def test_chatter_in_bot_thread_can_stay_silent(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch, answer='[NO_REPLY]')
+    engine = make_engine(tmp_path, monkeypatch, answers=('[NO_REPLY]',))
     guild = Guild()
     thread = Thread(guild, tid=700)
     thread.messages = [NS(id=60, author=NS(id=BOT_ID))]
-    await seed(cog, 3, thread_id=700)
+    await seed(engine, 3, thread_id=700)
     msg = Message(80, thread, 'kkkk verdade, Ana')
-    await cog.on_message(msg)
+    await engine.handle_message(msg)
     check('nothing sent', msg.replies == [] and thread.sent == [], msg.replies)
-    conv = await cog.store.get_by_handle(60)
+    conv = await engine.store.get_by_handle(60)
     check('no turn stored', len(conv['data']['turns']) == 3, conv['data']['turns'])
 
 
 async def test_new_conversation_in_bot_thread(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     thread = Thread(Guild(), tid=700)
     msg = Message(80, thread, 'outra pergunta')
-    await cog.on_message(msg)
+    await engine.handle_message(msg)
     check('expired conversation: a new one starts unprompted',
-          cog.runs and cog.runs[0][0] == f'{chat_threads.UNPROMPTED_HEADER}\n---\noutra pergunta', cog.runs)
+          engine.turns and engine.turns[0].question == f'{chat_threads.UNPROMPTED_HEADER}\n---\noutra pergunta', engine.turns)
     check('answered in place', len(msg.replies) == 1 and msg.opened == [])
 
-    silent = make_cog(tmp_path / 'b', monkeypatch, answer='[NO_REPLY]')
+    silent = make_engine(tmp_path / 'b', monkeypatch, answers=('[NO_REPLY]',))
     msg = Message(90, thread, 'conversa entre outras pessoas')
-    await silent.on_message(msg)
+    await silent.handle_message(msg)
     check('silent run posts and stores nothing',
           msg.replies == [] and await silent.store.get_by_handle(91) is None, msg.replies)
 
 
 async def test_other_threads_still_need_a_mention(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
+    engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
-    await cog.on_message(Message(80, Thread(guild, tid=701, owner_id=5), 'oi gente'))
-    await cog.on_message(Message(81, TextChannel(guild), 'oi gente'))
-    await cog.on_message(Message(82, Thread(guild, tid=700), '', mtype=discord.MessageType.pins_add))
-    check('nothing answered', cog.runs == [], cog.runs)
+    claimed = [
+        await engine.handle_message(Message(80, Thread(guild, tid=701, owner_id=5), 'oi gente')),
+        await engine.handle_message(Message(81, TextChannel(guild), 'oi gente')),
+        await engine.handle_message(Message(82, Thread(guild, tid=700), '', mtype=discord.MessageType.pins_add)),
+    ]
+    check('nothing answered', engine.turns == [] and claimed == [False, False, False], (engine.turns, claimed))
 
 
-async def test_monitors_skip_messages_in_bot_threads(monkeypatch):
-    monkeypatch.setattr(chat_threads, 'CHAT_THREADS_ENABLED', True)
-    monkeypatch.setattr(mon_mod, 'CHAT_MENTION_ENABLED', True)
-    cog = mon_mod.Monitors.__new__(mon_mod.Monitors)
-    cog.bot = NS(user=NS(id=BOT_ID, mentioned_in=lambda m: False), get_cog=lambda name: None)
-    guild = Guild()
-    check('the thread handler answers it', await cog._answered_elsewhere(Message(1, Thread(guild, tid=700))))
-    check('other threads still fire', not await cog._answered_elsewhere(Message(2, Thread(guild, tid=701, owner_id=5))))
-
-
-# --- The open_thread tool -----------------------------------------------------
+# --- The open_thread tool (through the real runner) ---------------------------
 
 class Completions:
     def __init__(self, responses):
@@ -420,44 +285,33 @@ def completion(content=None, tool_calls=None):
     return NS(choices=[NS(message=message, finish_reason='stop')], usage=None)
 
 
-async def _run_chat_with_tool(monkeypatch, available):
+async def _run_with_tool(tmp_path, monkeypatch, available):
     completions = Completions([
         completion(tool_calls=[('open_thread', '{"title": "Receita de bolo"}')]),
         completion('Aqui vai a receita.'),
     ])
-    cog = commands_mod.Commands.__new__(commands_mod.Commands)
-    cog.bot = NS(user=NS(id=BOT_ID, name='QuillBot', display_name='QuillBot'), get_cog=lambda name: None)
-    cog.client = NS(chat=NS(completions=completions))
-    monkeypatch.setattr(commands_mod, 'CHANNEL_CONTEXT_MESSAGES', 0)
-    result = await cog._run_chat('me passa uma receita de bolo', user=ASKER, thread_available=available)
-    return result, completions
+    services = make_services(tmp_path)
+    services.llm.client = NS(chat=NS(completions=completions))
+    register_core_tools(services.tools)
+    monkeypatch.setattr(runner_mod, 'CHANNEL_CONTEXT_MESSAGES', 0)
+    ctx = TurnContext(
+        bot=NS(user=NS(id=BOT_ID, name='QuillBot', display_name='QuillBot'), services=services),
+        profile=CHAT, question='me passa uma receita de bolo', user=ASKER,
+        thread_blocker=None if available else chat_threads.ANSWERS_IN_PLACE,
+    )
+    return await run_turn(ctx), completions
 
 
-async def test_open_thread_tool_reports_the_title(monkeypatch):
-    (answer, _, _, capture), completions = await _run_chat_with_tool(monkeypatch, True)
+async def test_open_thread_tool_reports_the_title(tmp_path, monkeypatch):
+    result, completions = await _run_with_tool(tmp_path, monkeypatch, True)
     check('tool offered', 'open_thread' in completions.tools[0], completions.tools)
-    check('answer unchanged', answer == 'Aqui vai a receita.', answer)
-    check('title handed to the delivery code', capture['thread_title'] == 'Receita de bolo', capture)
+    check('answer unchanged', result.answer == 'Aqui vai a receita.', result.answer)
+    check('title handed to the delivery code', result.thread_title == 'Receita de bolo', result)
 
 
-async def test_open_thread_tool_refuses_when_unavailable(monkeypatch):
-    (_, _, _, capture), completions = await _run_chat_with_tool(monkeypatch, False)
+async def test_open_thread_tool_refuses_when_unavailable(tmp_path, monkeypatch):
+    result, completions = await _run_with_tool(tmp_path, monkeypatch, False)
     check('tool list stays the same for prompt caching', 'open_thread' in completions.tools[0], completions.tools)
-    check('no thread requested', capture['thread_title'] is None, capture)
+    check('no thread requested', result.thread_title is None, result)
     tool_msgs = [m for m in completions.calls[1] if isinstance(m, dict) and m.get('role') == 'tool']
-    check('the model is told why', tool_msgs and 'Não dá' in tool_msgs[0]['content'], tool_msgs)
-
-
-async def test_cooldown_skips_quietly_in_bot_thread(tmp_path, monkeypatch):
-    cog = make_cog(tmp_path, monkeypatch)
-    guild = Guild()
-    thread = Thread(guild, tid=700)
-    thread.messages = [NS(id=60, author=NS(id=BOT_ID))]
-    await seed(cog, 3, thread_id=700)
-    cog._followup_cd[ASKER.id] = True
-    msg = Message(80, thread, 'mais uma')
-    await cog.on_message(msg)
-    check('no cooldown notice in the thread', msg.replies == [] and cog.runs == [], msg.replies)
-    mention = Message(81, TextChannel(guild), f'<@{BOT_ID}> oi')
-    await cog.on_message(mention)
-    check('a mention still gets the notice', len(mention.replies) == 1 and cog.runs == [], mention.replies)
+    check('the model is told why', tool_msgs and chat_threads.ANSWERS_IN_PLACE in tool_msgs[0]['content'], tool_msgs)
