@@ -256,6 +256,21 @@ MEMORY_DEDUPE_THRESHOLD: Final[float] = float(os.getenv('MEMORY_DEDUPE_THRESHOLD
 # Legacy lore encyclopedia — kept only as the one-time migration source for memory.db
 LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
 
+# --- Personality (per-server <personalidade> block in the system prompt) ---
+# Two sections per server: the base (who the bot is), edited by admins with
+# /persona or by the bot when someone with Manage Server asks, and the notes
+# (running jokes, nicknames, catchphrases), which the bot rewrites itself.
+PERSONA_ENABLED: Final[bool] = _flag('PERSONA_ENABLED')
+PERSONA_DB_PATH: Final[str] = os.getenv('PERSONA_DB_PATH', 'data/persona.db')
+PERSONA_BASE_MAX_CHARS: Final[int] = min(4000, int(os.getenv('PERSONA_BASE_MAX_CHARS', '3000')))
+PERSONA_NOTES_MAX_CHARS: Final[int] = min(4000, int(os.getenv('PERSONA_NOTES_MAX_CHARS', '800')))
+# How many times a day the bot may rewrite a server's notes on its own (0 = never).
+PERSONA_BOT_EDITS_PER_DAY: Final[int] = int(os.getenv('PERSONA_BOT_EDITS_PER_DAY', '5'))
+# Channel where every personality change is posted with a Revert button (defaults to the memory log).
+PERSONA_LOG_CHANNEL_ID: Final[int | None] = (
+    int(v) if (v := os.getenv('PERSONA_LOG_CHANNEL_ID', '').strip()) else MEMORY_LOG_CHANNEL_ID
+)
+
 # --- Episodes (summaries of past conversations kept as memories) ---
 # When a conversation expires, a cheap model summarizes it into one "conversa"
 # memory per participant, so later conversations can pick up where it left off.

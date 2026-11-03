@@ -66,6 +66,7 @@ CHAT = Profile(
         *MONITOR_TOOLS,
         'summarize_channel',
         'server_wrapped',
+        'persona_update',
         'add_reaction',
         'open_thread',
     ),

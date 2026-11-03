@@ -2,7 +2,8 @@
 
 AI-powered Discord bot that takes part in the **Miners' Refuge** community's conversations: it answers when mentioned, replied to or called by name, remembers people and past conversations, knows when to stay quiet, and brings Minecraft server administration tools into the chat — documentation search, log analysis, Spark diagnosis and plugin search.
 
-Its personality is the server's: it lives in the server's memories (usually pinned), which every turn injects.
+Its personality is the server's: a `<personalidade>` block per server — a base the admins write and notes the bot keeps about itself — that rides in every system prompt (see [`/persona`](#persona--personality)).
+
 
 Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augmented Generation) over multiple documentation sources.
 
@@ -35,6 +36,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **General Chat** | Web search, server/history context awareness, one voice across every entry point |
 | **Episodes** | When a conversation ends, the bot keeps a short summary of it per participant, so it can pick the subject up later ("e aí, deu certo o backup?") |
 | **Server Wrapped** | `/wrapped` or asking the bot: who talked most, busiest channels and hours, who replied to whom, favorite emojis, most-reacted messages; optional weekly/monthly automatic recap |
+| **Personality** | Per server, in the system prompt: a *base* (who the bot is) that admins edit with `/persona` or ask the bot to change, and *notes* (running jokes, nicknames, catchphrases) the bot rewrites itself, a few times a day at most. Every change is versioned, logged with a Revert button and revertible |
 | **Settings** | `/config`: per channel (when to answer, name calls, threads, reply format, log detection, channel instructions) and per server (extra names, automatic Wrapped) |
 | **Edits & deletes** | Deleting a message the bot answered deletes the answer; editing it within a minute re-answers it |
 | **Chat Threads** | Long or off-topic conversations move into a thread on the asker's message, so the channel keeps one message; inside it the bot answers without a mention and stays quiet when people talk among themselves |
@@ -162,7 +164,7 @@ Re-index documentation vectors.
 - Per-source commit SHA tracking for granular updates
 
 #### `/memory <subcommand>` — Persistent Bot Memory
-The bot maintains long-term memories: atomic one-sentence facts about the server (guild-wide) or about individual users (scoped, privacy-guarded). Relevant memories are **automatically injected** into every turn — the LLM doesn't need to search first. The bot's personality and house rules usually live here too, as pinned server memories.
+The bot maintains long-term memories: atomic one-sentence facts about the server (guild-wide) or about individual users (scoped, privacy-guarded). Relevant memories are **automatically injected** into every turn — the LLM doesn't need to search first. The bot's personality has its own place now ([`/persona`](#persona--personality)); `/persona importar` moves personality memories there.
 
 | Subcommand | Who | Description |
 |---|---|---|
@@ -191,6 +193,28 @@ The bot maintains long-term memories: atomic one-sentence facts about the server
 - **One-time migration** — existing `lore.db` entries import automatically on first start (curated → pinned, pending skipped; `lore.db` is kept on disk untouched)
 - Tool errors degrade gracefully — memory failures return error strings to the LLM instead of aborting the turn
 - Set `MEMORY_ENABLED=false` to remove the tools and prompt guidance entirely
+
+#### `/persona` — Personality
+The bot's personality on each server, as a `<personalidade>` block in the system prompt (`core/persona.py`, `cogs/persona.py`). Unlike memories, it carries instruction weight, fits a whole document, can't be archived by a stray `memory_write`, and — since it rarely changes — stays inside the provider's prompt cache.
+
+| Section | What | Who changes it | Size |
+|---|---|---|---|
+| **Base** | Who the bot is: voice, humor, values, hard rules | Admins (`/persona editar`), or the bot when someone with **Manage Server** asks it to | `PERSONA_BASE_MAX_CHARS` (3000) |
+| **Notas** | What it picked up on the server: running jokes, nicknames, catchphrases | The bot itself (`persona_update`), at most `PERSONA_BOT_EDITS_PER_DAY` times a day; admins too | `PERSONA_NOTES_MAX_CHARS` (800) |
+
+| Subcommand | Who | Description |
+|---|---|---|
+| `/persona ver` | everyone | Both sections, their versions and who changed them last |
+| `/persona editar [secao]` | Manage Server | Edit a section in a text box pre-filled with the current text |
+| `/persona historico [secao]` | Manage Server | Last changes, with ids |
+| `/persona reverter <id>` | Manage Server | Put a section back to what it was before a change |
+| `/persona travar <sim/não>` | Manage Server | Stop (or allow again) the bot changing its own notes |
+| `/persona importar <ids>` | Manage Server | Append server memories (e.g. a pinned personality memory) to the base and unpin them |
+
+- **The tool** — `persona_update(section, content, reason)` replaces a whole section (the model rewrites it short instead of appending forever). A member asking to change the base is refused, and the model is told to suggest talking to an admin; "become someone else" requests are not a reason to touch the notes
+- **Audit** — every change is a new version with before/after (`persona_history`); with `PERSONA_LOG_CHANNEL_ID` (defaults to `MEMORY_LOG_CHANNEL_ID`) each one is posted with a **↩️ Reverter** button (admins of that server; the button lasts a day, `/persona reverter` always works)
+- Server memories that say how the bot should act still count, but the block is the place for it
+- Set `PERSONA_ENABLED=false` to remove the command, the tool and the block
 
 #### `/wrapped [periodo]` — Server Wrapped
 A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; or `14d`): messages and active members, who talked most, busiest channels, peak hour and weekday, who replied to whom most, favorite emojis (from messages and reactions) and the most-reacted messages with links, introduced in two or three lines in the bot's own voice. People are named, never pinged.
@@ -307,9 +331,9 @@ Every feature talks to the others through shared services on `bot.services` (`co
 | `settings` (`core/settings.py`) | Server/channel settings (`/config`) |
 | `conversations` (`core/conversations.py`) | The conversation store (one for every kind of conversation) |
 | `chat` (`core/chat_engine.py`) | The chat engine: answers messages, monitor hits, scheduled tasks, slash commands and Spark analyses; anchors conversations on posts |
-| `memory`, `history`, `docs` | Set by those cogs when they load |
+| `memory`, `history`, `docs`, `persona` | Set by those cogs when they load |
 
-A turn is one `TurnContext` (`core/turn.py`: who, where, the stored conversation, images, per-turn tool state) run by `core/runner.py:run_turn` with a **profile** (`core/profiles.py`): `chat` (mentions, replies, threads, name calls, `/chat`, monitors, scheduled tasks), `ask` (docs-first `/ask`) or `spark`. The profile picks the prompt (`core/prompts.py` — one role and one set of rules for all of them), the tools by name in a fixed order, the model and how answers look; `core/delivery.py` then decides plain message vs embed vs thread.
+A turn is one `TurnContext` (`core/turn.py`: who, where, the stored conversation, images, per-turn tool state) run by `core/runner.py:run_turn` with a **profile** (`core/profiles.py`): `chat` (mentions, replies, threads, name calls, `/chat`, monitors, scheduled tasks), `ask` (docs-first `/ask`) or `spark`. The profile picks the prompt (`core/prompts.py` — one role and one set of rules for all of them, plus the server's `<personalidade>` block), the tools by name in a fixed order, the model and how answers look; `core/delivery.py` then decides plain message vs embed vs thread.
 
 ## AI & RAG System
 
@@ -404,6 +428,7 @@ QuillBot/
 │   ├── budget.py         # Per-person / per-server sliding-window budgets
 │   ├── settings.py       # Server/channel settings store
 │   ├── episodes.py       # Summaries of ended conversations → episode memories
+│   ├── persona.py        # Per-server personality sections, versions, the <personalidade> block
 │   ├── conversations.py  # Conversation store + history/current-message builders
 │   ├── context.py        # <contexto> block, channel history/window/gap fetchers
 │   ├── context_tools.py  # Core tools: channel history, server info, message context, reactions, threads, web
@@ -418,6 +443,7 @@ QuillBot/
 │   ├── chat.py           # /chat, /ask, the chat router handler, edit/delete events, the episode worker
 │   ├── commands.py       # /docs, /help, /flags, /plov, /plano, /health, /sync
 │   ├── server_config.py  # /config — server and channel settings
+│   ├── persona.py        # /persona, the persona_update tool, change log with Revert
 │   ├── wrapped.py        # /wrapped, server_wrapped tool, automatic weekly/monthly recaps
 │   ├── docs_rag.py       # Docs RAG — indexing, search, reranking, /reindex, search_docs/search_plugins tools
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, reactions, history tools, Wrapped stats
@@ -437,6 +463,7 @@ QuillBot/
     ├── vectors.json/.npy # Docs RAG vector store
     ├── memory.db          # Persistent memory (memories + history)
     ├── settings.db        # /config settings
+    ├── persona.db         # Personality sections + history
     ├── conversations.db   # Conversations (handles, triggers, episode state)
     ├── lore.db            # Legacy lore encyclopedia (kept as migration source)
     └── history/          # Per-guild history stores
@@ -627,10 +654,15 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |
 | `CONVERSATIONS_TRAJECTORY_MAX_CHARS` | `120000` | Hard budget on the replayed trajectory payload; turns are collapsed to compact rendering when exceeded |
 
-### Episodes, Settings and Wrapped
+### Personality, Episodes, Settings and Wrapped
 
 | Variable | Default | Description |
 |---|---|---|
+| `PERSONA_ENABLED` | `true` | The `<personalidade>` block, `/persona` and the `persona_update` tool |
+| `PERSONA_DB_PATH` | `data/persona.db` | Personality sections and their history |
+| `PERSONA_BASE_MAX_CHARS` / `PERSONA_NOTES_MAX_CHARS` | `3000` / `800` | Section sizes (at most 4000, Discord's text box limit) |
+| `PERSONA_BOT_EDITS_PER_DAY` | `5` | Times a day the bot may rewrite a server's notes on its own (`0` never) |
+| `PERSONA_LOG_CHANNEL_ID` | `MEMORY_LOG_CHANNEL_ID` | Where personality changes are posted with a Revert button |
 | `EPISODES_ENABLED` | `true` | Summarize expired conversations into one *conversa* memory per participant (needs `MEMORY_ENABLED`) |
 | `EPISODES_MODEL` | `SUMMARY_MODEL` → `CHAT_MODEL` | Model for those summaries |
 | `EPISODES_PER_USER` | `20` | Newest episodes kept per person (older ones archived) |
@@ -724,6 +756,7 @@ pytest -k reindex              # tests whose name matches
 | `test_mentions.py` | Which mentions in a reply become real pings |
 | `test_message_media.py` | Stickers, GIFs, custom emojis, reactions and the `add_reaction` tool |
 | `test_monitors.py` | Monitor validation, filter matching, store, cooldowns, skipping messages the bot already answers, tools and permissions, silent vs. reply runs |
+| `test_persona.py` | Personality store and versions, the block in the system prompt, who may change base vs notes, daily limit and lock, revert and log, importing memories, the edit modal |
 | `test_runner.py` | The runner: docs tools in normal chat, profile tool order, server personality and channel instructions in the prompt, structured tools, LLM retries, status lines |
 | `test_scheduler.py` | Cron job firing and rescheduling |
 | `test_settings_router.py` | `/config` values and lookup order (channel → parent → server → default), the message router |

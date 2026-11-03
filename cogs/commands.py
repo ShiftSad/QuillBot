@@ -155,7 +155,7 @@ class Commands(commands.Cog):
                 "Me mencione, responda a uma mensagem minha ou me chame pelo nome — "
                 "várias mensagens seguidas viram uma resposta só. Conversas longas vão para "
                 "uma thread; apagar ou editar sua mensagem logo depois apaga ou refaz a resposta.\n"
-                "Admins ajustam por canal com `/config`."
+                "Admins ajustam por canal com `/config` e definem minha personalidade com `/persona`."
             ),
             inline=False,
         )

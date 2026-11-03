@@ -916,6 +916,10 @@ class Memory(commands.Cog, name='Memory'):
             logger.exception('[memory] embedding failed')
             return None
 
+    async def get(self, guild_id: int, memory_id: int) -> dict | None:
+        """One memory by id (any status), or ``None``."""
+        return await asyncio.to_thread(self.store.get_memory, guild_id, memory_id)
+
     # --- Provenance ---
 
     def told_by_note(self, guild_id: int, entry: dict) -> str:

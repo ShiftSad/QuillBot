@@ -201,10 +201,13 @@ class Wrapped(commands.Cog):
         if not llm.available or not stats['messages']:
             return ''
         persona = ''
+        if getattr(self.services, 'persona', None) is not None:
+            persona = self.services.persona.block(guild.id)
         memory = self.services.memory
         if memory is not None:
             try:
-                persona = await memory.build_memory_block(guild.id, 'retrospectiva do servidor, jeito do bot') or ''
+                memories = await memory.build_memory_block(guild.id, 'retrospectiva do servidor, jeito do bot') or ''
+                persona = f'{persona}\n\n{memories}'.strip()
             except Exception:
                 logger.debug('memory block for wrapped failed', exc_info=True)
         try:
@@ -212,7 +215,8 @@ class Wrapped(commands.Cog):
                 model=SUMMARY_MODEL,
                 system=(
                     'Você é o bot deste servidor do Discord. Escreva 2 ou 3 frases curtas, em português, '
-                    'apresentando a retrospectiva abaixo com o seu jeito (veja as memórias, se houver). '
+                    'apresentando a retrospectiva abaixo com o seu jeito (veja sua personalidade e as '
+                    'memórias abaixo, se houver). '
                     'Destaque uma ou duas curiosidades. Cite pessoas pelo nome, nunca com @. Sem títulos.\n\n'
                     + persona
                 ),

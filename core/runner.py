@@ -5,7 +5,7 @@ scheduled tasks and Spark analyses used to be two copies of the same code
 (``Commands._run_chat`` and ``DocsRAG._run_agent``). :func:`run_turn` builds
 the request once, from a :class:`~core.turn.TurnContext` and its profile:
 
-    [system: profile prompt + identity + conversation block]
+    [system: profile prompt + <personalidade> + identity + conversation block]
     [Spark report prelude, when one is loaded]
     [replayed history]
     [current message: <contexto>, <canal>, <memory>, recent channel window, question]
@@ -65,6 +65,12 @@ def normalize_sources(raw: list[dict]) -> list[dict]:
 
 def _system_prompt(ctx: TurnContext) -> str:
     system = ctx.profile.system_prompt
+    persona = getattr(ctx.services, 'persona', None)
+    if persona is not None and ctx.guild is not None:
+        # Per server and rarely changed: stays inside the cached prefix.
+        block = persona.block(ctx.guild.id)
+        if block:
+            system += '\n\n' + block
     report = ctx.spark_report
     if report is not None and getattr(report, 'tick_length_threshold_ms', 0) > 0:
         system += lag_spike_warning(report.tick_length_threshold_ms)

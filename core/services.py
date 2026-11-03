@@ -10,8 +10,8 @@ Features talk to each other through these public objects instead of
 - ``conversations`` — the conversation store
 - ``chat`` — the chat engine (answer a message, a monitor hit, a scheduled
   task, a slash command; anchor a conversation on a message)
-- ``memory``, ``history``, ``docs`` — set by those cogs when they load, so
-  others can use them without knowing the cog
+- ``memory``, ``history``, ``docs``, ``persona`` — set by those cogs when
+  they load, so others can use them without knowing the cog
 """
 
 from __future__ import annotations
@@ -56,3 +56,4 @@ class Services:
         self.memory: Any = None
         self.history: Any = None
         self.docs: Any = None
+        self.persona: Any = None

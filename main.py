@@ -52,6 +52,7 @@ COGS = [
     'cogs.history_rag',
     'cogs.docs_rag',
     'cogs.memory',
+    'cogs.persona',
     'cogs.log_analyzer',
     'cogs.plugins',
     'cogs.spark',

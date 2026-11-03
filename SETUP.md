@@ -211,6 +211,7 @@ Every message goes through one router (`core/router.py`): passive observers (his
 | `/resumo`   | Summarize what happened in a channel                 | Yes         |
 | `/wrapped`  | Server recap: who talked most, channels, emojis…     | Optional**  |
 | `/config`   | Server and channel settings (Manage Server)          | No          |
+| `/persona`  | The bot's personality on this server (editing needs Manage Server) | No |
 | `/memory`, `/monitor`, `/schedule` | Memories, standing triggers, scheduled tasks | Yes |
 | `/analyze`  | Analyze a server log with AI (mclo.gs, pastebin, or file) | Yes   |
 | `/docs`     | Search docs or get the documentation link           | No*         |
@@ -253,6 +254,7 @@ QuillBot/
 │   ├── chat.py         # /chat, /ask, conversations, edits/deletes, episodes
 │   ├── commands.py     # Utility slash commands (/docs, /help, /flags, etc.)
 │   ├── server_config.py# /config
+│   ├── persona.py      # /persona and the bot's personality per server
 │   ├── wrapped.py      # /wrapped and automatic recaps
 │   ├── docs_rag.py     # RAG pipeline: indexing, search, /reindex, search_docs tool
 │   ├── log_analyzer.py # Log analysis: pattern matching, /analyze, AI analysis
