@@ -560,11 +560,15 @@ class ChatEngine:
         rendered = render(out, guild)
         if len(reply_ids) == 1 and len(rendered) == 1:
             kwargs = rendered[0]
+            suppress = kwargs.pop('suppress_embeds', False)
             kwargs.setdefault('content', None)
             kwargs.setdefault('embed', None)
             kwargs.setdefault('view', None)
             try:
-                return [await channel.get_partial_message(int(reply_ids[0])).edit(**kwargs)]
+                # Only a fetched Message can set the flag, and it must follow the
+                # new style: a suppressed message would hide an embed answer.
+                old = await channel.get_partial_message(int(reply_ids[0])).fetch()
+                return [await old.edit(suppress=suppress, **kwargs)]
             except discord.HTTPException:
                 logger.info('could not edit answer %s; sending a new one', reply_ids[0], exc_info=True)
         await self._delete_messages(channel, reply_ids)

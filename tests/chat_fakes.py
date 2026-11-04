@@ -218,6 +218,9 @@ class PartialChannel:
         class _Partial:
             id = mid
 
+            async def fetch(self):
+                return self
+
             async def edit(self, **kwargs):
                 log.append(('edit', mid, kwargs))
                 return NS(id=mid)
