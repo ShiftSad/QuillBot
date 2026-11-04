@@ -42,6 +42,7 @@ def test_plain_render_allows_only_resolved_pings():
     allowed = kwargs['allowed_mentions']
     check('only that user may be pinged', [u.id for u in allowed.users] == [2] and not allowed.everyone and not allowed.roles, allowed)
     check('no embed', 'embed' not in kwargs)
+    check('link previews off', kwargs['suppress_embeds'] is True, kwargs)
 
 
 def test_plain_sources_ride_as_subtext():
@@ -68,6 +69,7 @@ def test_embed_render_puts_pings_in_content_and_pages_sources():
     [kwargs] = render(out, GUILD)
     check('embed with title', kwargs['embed'].title == '🔥 Spark' and '<@2>' in kwargs['embed'].description, kwargs)
     check('pings go in content (embeds never notify)', kwargs['content'] == '<@2>', kwargs.get('content'))
+    check('the flag would hide the embed itself', 'suppress_embeds' not in kwargs, kwargs)
     check('sources page behind the paginator', isinstance(kwargs['view'], discord.ui.View) and len(kwargs['view'].embeds) == 2)
 
 

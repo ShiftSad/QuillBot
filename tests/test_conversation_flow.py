@@ -5,6 +5,7 @@ import asyncio
 
 from core import chat_engine
 from core.budget import Budget
+from core.delivery import Outgoing
 from core.tool_loop import EMPTY_ANSWER_FALLBACK
 from core.turn import FOLLOW_HEADER, NAME_HEADER, TurnResult
 
@@ -283,8 +284,16 @@ async def test_editing_the_question_re_answers_in_place(tmp_path, monkeypatch):
     check('re-ran with the new text and no history', len(engine.turns) == 2 and engine.turns[1].question == 'qual a versão do paper?' and engine.turns[1].history == [], engine.turns[-1].question)
     edits = [e for e in engine.partial_log if e[0] == 'edit']
     check('the old answer was edited, not a new message', edits and edits[0][1] == 81 and edits[0][2]['content'] == 'segunda', engine.partial_log)
+    check('a plain edit keeps link previews off', edits[0][2]['suppress'] is True, edits[0][2])
     conv = await engine.store.get_by_handle(81)
     check('still one turn, now the new one', len(conv['data']['turns']) == 1 and conv['data']['turns'][0]['answer'] == 'segunda', conv)
+
+
+async def test_an_answer_edited_into_an_embed_is_not_suppressed(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    await engine._edit_previous(Outgoing('oi', style='embed'), {'reply_ids': ['81'], 'channel_id': 10}, Guild())
+    [(_, _, kwargs)] = engine.partial_log
+    check('flag cleared, or the embed would be hidden', kwargs['suppress'] is False and 'suppress_embeds' not in kwargs, kwargs)
 
 
 async def test_unchanged_or_late_edits_are_ignored(tmp_path, monkeypatch):

@@ -341,7 +341,7 @@ class LogAnalyzer(commands.Cog):
                         else:
                             await message.reply(
                                 'Não consegui fazer o upload para o mclo.gs. '
-                                'Você pode enviar manualmente em https://mclo.gs'
+                                'Você pode enviar manualmente em <https://mclo.gs>'
                             )
                         if response:
                             break
@@ -354,7 +354,7 @@ class LogAnalyzer(commands.Cog):
             )
 
         if response:
-            await message.reply(response)
+            await message.reply(response, suppress_embeds=True)
 
     # --- AI Log Analysis ---
 

@@ -160,7 +160,7 @@ def render(out: Outgoing, guild: Any, *, prefix: str = '', extra_ping: int | Non
     chunks = split_plain(body) or ['…']
     if footer:
         chunks.append(footer)
-    return [{'content': c, 'allowed_mentions': _allowed(ping_ids)} for c in chunks]
+    return [{'content': c, 'allowed_mentions': _allowed(ping_ids), 'suppress_embeds': True} for c in chunks]
 
 
 async def deliver(
