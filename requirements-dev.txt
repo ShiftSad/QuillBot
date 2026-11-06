@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8.0
+# Pinned exactly: CI and local runs must agree on what a lint error is.
+ruff==0.15.12

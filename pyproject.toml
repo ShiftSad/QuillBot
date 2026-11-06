@@ -1,0 +1,22 @@
+# Tool configuration only — QuillBot is an application, not a distributable package.
+# Tests are configured in pytest.ini; the runtime dependencies in requirements.txt.
+
+[tool.ruff]
+# Matches the Dockerfile base image, which is what production actually runs.
+target-version = "py311"
+# p99 of the tracked sources sits just under this; E501 is not enforced yet, so
+# raising it later stays a separate, reviewable change.
+line-length = 120
+extend-exclude = ["data"]
+
+[tool.ruff.format]
+# The whole tree is single-quoted; without this `ruff format` would rewrite it.
+quote-style = "single"
+# CI runs `ruff check`, not `ruff format --check`: even with the quotes kept, the
+# formatter still wants to rewrap 72 files, which belongs in a commit of its own.
+
+[tool.ruff.lint]
+# Deliberately the ruff default set. The wider candidates each found real hits
+# (I001 46, B 12, UP 10, SIM 70) that belong in their own commits, and the gate
+# has to be green from the first run to be worth having.
+select = ["E4", "E7", "E9", "F"]

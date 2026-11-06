@@ -742,7 +742,10 @@ pip install -r requirements-dev.txt
 pytest                         # whole suite
 pytest tests/test_summary.py   # one file
 pytest -k reindex              # tests whose name matches
+ruff check .                   # lint (rules configured in pyproject.toml)
 ```
+
+`.github/workflows/ci.yml` runs `ruff check .` and `pytest` on every push to `main` and on pull requests, on Python 3.11 — the version the Docker image ships, so a newer local interpreter can't hide an incompatibility from production.
 
 | File | Covers |
 |---|---|
