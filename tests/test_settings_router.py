@@ -83,7 +83,10 @@ async def test_router_observes_everything_and_claims_in_priority_order():
     router.observe('history', observer)
     router.handle('monitors', monitors, priority=20)
     router.handle('chat', chat, priority=10)
-    human = lambda mid, content: NS(id=mid, content=content, author=NS(bot=False))
+
+    def human(mid, content):
+        return NS(id=mid, content=content, author=NS(bot=False))
+
     check('chat claims first', await router.dispatch(human(1, 'para o bot')) == 'chat')
     check('monitors get the rest', await router.dispatch(human(2, 'outra coisa')) == 'monitors')
     check('bots are observed but never handled', await router.dispatch(NS(id=3, content='x', author=NS(bot=True))) is None)

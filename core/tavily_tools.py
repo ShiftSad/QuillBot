@@ -1,12 +1,11 @@
 """Tavily web search and content extraction tools for the LLM agentic loop."""
 
-import json
 import logging
 from typing import Any
 
 from tavily import AsyncTavilyClient
 
-from config import TAVILY_API_KEY, TAVILY_AVAILABLE
+from config import TAVILY_API_KEY
 
 logger = logging.getLogger(__name__)
 

@@ -348,12 +348,14 @@ The current 18 patterns in `responses/errors.py` cover common cases. The followi
 2. Create `docker-compose.yml` with volume mount for `data/` (vector store persistence) and `.env` passthrough
 3. Document in `SETUP.md`
 
-### 6.3 CI/CD Pipeline ⚡ Low
+### 6.3 CI/CD Pipeline ⚡ Low ✅ Implemented (1–4; 5 still open)
 
-Add a GitHub Actions workflow:
-1. **Lint** — `ruff check .` or `flake8`
-2. **Test** — `pytest` (once 6.1 is implemented)
-3. **Build** — verify `pip install -r requirements.txt` succeeds
-4. Trigger on push to `main` and on PRs
-5. Optional: automated Docker image build and push to GHCR
+`.github/workflows/ci.yml` runs on push to `main` and on pull requests:
+`pip install -r requirements-dev.txt` → `ruff check .` → `pytest`, on
+**Python 3.11** — the version the Dockerfile ships (local development runs 3.14).
+
+Rules live in `pyproject.toml` and are deliberately the default `E4,E7,E9,F` set.
+Widening it is follow-up work, one ruleset per commit: `I001` currently has 46
+hits, `B` 12, `UP` 10, `SIM` 70, and `E501` at 120 columns 262. Item 5 (build the
+image and push it to GHCR) is not implemented.
 
