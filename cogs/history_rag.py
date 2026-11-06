@@ -16,7 +16,7 @@ try:
 except ImportError:
     TTLCache = dict  # type: ignore
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 from core.discord_text import format_chunk_line, format_message_line, message_content_text, render_search_results
 from core.local_inference import run_local_model
@@ -44,7 +44,6 @@ from config import (
     HISTORY_SQL_TIMEOUT_SECONDS,
     HISTORY_SQL_TOOL_ENABLED,
     HISTORY_TIME_DECAY_LAMBDA,
-    HISTORY_WINDOW_OVERLAP,
     HISTORY_WINDOW_SIZE,
     LOCAL_RERANK_DEVICE,
     LOCAL_RERANK_MODEL,
@@ -1864,7 +1863,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         lines = [" | ".join(cols)] if cols else []
         for r in rows:
             lines.append(" | ".join(_sql_cell(v) for v in r))
-            if sum(len(l) for l in lines) > _SQL_OUTPUT_CHARS:
+            if sum(len(line) for line in lines) > _SQL_OUTPUT_CHARS:
                 lines.pop()
                 truncated = True
                 lines.append(f"…saída truncada em {_SQL_OUTPUT_CHARS} caracteres")

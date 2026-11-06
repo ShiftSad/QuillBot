@@ -59,7 +59,7 @@ BM = '<@900000000000000001>'
 STRIP_CASES = [
     # addressing mentions are dropped
     (f'{BM} como otimizar?', None, 'como otimizar?'),
-    (f'<@!900000000000000001>, como otimizar?', None, 'como otimizar?'),
+    ('<@!900000000000000001>, como otimizar?', None, 'como otimizar?'),
     (f'como otimizar? {BM}', None, 'como otimizar?'),
     (BM, None, ''),
     # in-sentence mentions keep their place as @name (the reported bug)

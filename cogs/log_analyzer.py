@@ -89,7 +89,7 @@ def _extract_relevant_lines(text: str, limit: int = MAX_LOG_CONTEXT) -> str:
     """
     lines = text.splitlines(keepends=True)
     header = lines[:_LOG_HEADER_LINES]
-    relevant = [l for l in lines[_LOG_HEADER_LINES:] if _LOG_ERROR_PATTERN.search(l)]
+    relevant = [line for line in lines[_LOG_HEADER_LINES:] if _LOG_ERROR_PATTERN.search(line)]
     filtered = (
         ''.join(header)
         + '\n[... linhas informativas omitidas — exibindo apenas erros e avisos ...]\n\n'

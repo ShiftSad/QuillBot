@@ -46,12 +46,12 @@ def chunk(mid, gid, cid, cname, aid, aname, afull, content, ts, reply_to=None):
 
 
 def build_chunks():
-    alice = lambda mid, content, ts, cid=GENERAL, cname="general", reply=None: chunk(
-        mid, GID, cid, cname, ALICE_ID, "Alice", "Alice (@alice)", content, ts, reply
-    )
-    bob = lambda mid, content, ts, reply=None: chunk(
-        mid, GID, DEV, "dev", BOB_ID, "Bob", "Bob (@bob)", content, ts, reply
-    )
+    def alice(mid, content, ts, cid=GENERAL, cname="general", reply=None):
+        return chunk(mid, GID, cid, cname, ALICE_ID, "Alice", "Alice (@alice)", content, ts, reply)
+
+    def bob(mid, content, ts, reply=None):
+        return chunk(mid, GID, DEV, "dev", BOB_ID, "Bob", "Bob (@bob)", content, ts, reply)
+
     return [
         alice(1, "server lag is terrible today", "2025-06-01T10:00:00+00:00"),
         alice(2, "restart fixed the server lag", "2025-06-01T10:02:00+00:00", reply="1"),

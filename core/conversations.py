@@ -355,7 +355,7 @@ def make_turn(
             if s.get('url')
         ][:6],
         'reply_to': str(reply_to) if reply_to else None,
-        'prior_context': [l for l in (prior_context or []) if l][:max(30, CONVERSATIONS_GAP_MESSAGES)],
+        'prior_context': [line for line in (prior_context or []) if line][:max(30, CONVERSATIONS_GAP_MESSAGES)],
     }
     context_refs = [u for u in (context_images or []) if u][:image_store.MAX_IMAGES_PER_TURN]
     if context_refs:
@@ -470,7 +470,7 @@ def _prior_context_head(lines: list[str], channel_id: str | int | None) -> str:
 
 def _prior_context_block(turn: dict) -> str:
     """Render the channel chatter captured before a turn's question, if any."""
-    prior = [l for l in (turn.get('prior_context') or []) if l]
+    prior = [line for line in (turn.get('prior_context') or []) if line]
     return _prior_context_head(prior, turn.get('channel_id'))
 
 
@@ -686,7 +686,7 @@ def build_current_message(
     inline: list[dict] = []
     parts: list[dict] | None = None
     head = (f"{context_blocks}\n\n" if context_blocks else '') + _prior_context_head(
-        [l for l in (prior_context or []) if l], channel_id
+        [line for line in (prior_context or []) if line], channel_id
     )
     text = question
     tag = author_tag(author, ts, reply_to=reply_to)

@@ -153,7 +153,9 @@ def test_linked_media_falls_back():
 
 
 def test_context_groups_media_first_then_emoji_sheets():
-    img = lambda i: SimpleNamespace(id=i, filename=f'{i}.png', content_type='image/png', url='u')
+    def img(i):
+        return SimpleNamespace(id=i, filename=f'{i}.png', content_type='image/png', url='u')
+
     messages = [  # newest first
         fake_message(6, '<:a:111111111111111111>'),
         fake_message(5, attachments=[img(50)]),

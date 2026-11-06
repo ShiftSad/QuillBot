@@ -100,7 +100,7 @@ def test_partial_reindex_keeps_other_sources():
     by_source = {}
     for c in rag.chunks:
         by_source.setdefault(c['source'], []).append(c['title'])
-    check('other sources untouched', all(len(by_source[l]) == 2 for l in LABELS if l != 'PaperMC'), by_source)
+    check('other sources untouched', all(len(by_source[label]) == 2 for label in LABELS if label != 'PaperMC'), by_source)
     check('reindexed source replaced', sorted(by_source['PaperMC']) == ['new-2000', 'new-2001', 'new-2002'], by_source['PaperMC'])
     check('matrix rows stay aligned with chunks', _aligned(rag))
     check('composite SHA unchanged on partial', rag._last_commit_sha == 'composite-old')
